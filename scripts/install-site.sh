@@ -17,4 +17,5 @@ pip3 install django-discord-integration
 pip3 install django_select2
 pip3 install websocket-client
 pip3 install python-memcached
+pip3 install Redis
 python3 manage.py check

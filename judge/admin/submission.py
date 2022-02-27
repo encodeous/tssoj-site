@@ -64,7 +64,7 @@ class SubmissionTestCaseInline(admin.TabularInline):
 
 
 class ContestSubmissionInline(admin.StackedInline):
-    fields = ('problem', 'participation', 'points', 'bonus')
+    fields = ('problem', 'participation', 'points')
     model = ContestSubmission
 
     def get_formset(self, request, obj=None, **kwargs):
