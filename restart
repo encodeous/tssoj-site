@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+supervisord = ['site', 'bridged', 'judge', 'wsevent', 'celery', 'mathoid'] 
+nginx = ['nginx']
+
+op = sys.argv[1:] or ['all']
+
+os.system('supervisorctl update')
+
+def restart(name):
+    if name == 'nginx':
+        os.system('service nginx restart')
+    else:
+        os.system('supervisorctl restart {}'.format(name))
+
+if 'all' in op:
+    for process in supervisord + nginx:
+        restart(process)
+else:
+    for x in filter((supervisord + nginx).__contains__, op):
+        restart(x)

@@ -11,12 +11,13 @@ from django.forms import Form, modelformset_factory
 from django.http import Http404, HttpResponsePermanentRedirect, HttpResponseRedirect
 from django.urls import reverse
 from django.utils.translation import gettext as _, gettext_lazy, ungettext
+from django.utils import timezone
 from django.views.generic import DetailView, FormView, ListView, UpdateView, View
 from django.views.generic.detail import SingleObjectMixin, SingleObjectTemplateResponseMixin
 from reversion import revisions
 
 from judge.forms import EditOrganizationForm
-from judge.models import Organization, OrganizationRequest, Profile
+from judge.models import BlogPost, Comment, Organization, OrganizationRequest, Problem, Profile
 from judge.utils.ranker import ranker
 from judge.utils.views import TitleMixin, generic_message
 
@@ -52,6 +53,8 @@ class OrganizationMixin(object):
             org = self.object
         if not self.request.user.is_authenticated:
             return False
+        if self.request.user.has_perm('judge.edit_all_organization'):
+            return True
         profile_id = self.request.profile.id
         return org.admins.filter(id=profile_id).exists() or org.registrant_id == profile_id
 
@@ -82,6 +85,16 @@ class OrganizationHome(OrganizationDetailView):
         context = super(OrganizationHome, self).get_context_data(**kwargs)
         context['title'] = self.object.name
         context['can_edit'] = self.can_edit_organization()
+        context['is_member'] = self.request.profile in self.object if self.request.user.is_authenticated else False
+        context['new_problems'] = Problem.objects.filter(is_public=True, is_organization_private=True, organizations=self.object) \
+                                                 .order_by('-date', '-id')[:7]
+        context['posts'] = BlogPost.objects.filter(visible=True, publish_on__lte=timezone.now(), is_organization_private=True, organizations=self.object) \
+                                           .order_by('-sticky', '-publish_on').prefetch_related('authors__user', 'organizations')
+        context['post_comment_counts'] = {
+            int(page[2:]): count for page, count in
+                Comment.objects.filter(page__in=['b:%d' % post.id for post in context['posts']], hidden=False)
+                               .values_list('page').annotate(count=Count('page')).order_by()
+        }
         return context
 
 

@@ -1,0 +1,2 @@
+. siteenv/bin/activate
+git pull origin master && pip install -r requirements.txt && python manage.py migrate && python manage.py check && ./build all

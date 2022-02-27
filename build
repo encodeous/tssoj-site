@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+import os
+import sys
+ 
+ 
+op = sys.argv[1:] or ['static']
+ 
+for x in op:
+    if x == 'all' or x == 'static':
+        os.system('. siteenv/bin/activate && ./make_style.sh && python manage.py collectstatic --noinput')
+    if x == 'all' or x == 'locale':            
+        os.system('. siteenv/bin/activate && python manage.py compilemessages && python manage.py compilejsi18n')
