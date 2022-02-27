@@ -47,6 +47,8 @@ class TicketForm(forms.Form):
             profile = self.request.profile
             if profile.mute:
                 raise ValidationError(_('Your part is silent, little toad.'))
+            if not self.request.in_contest and not profile.has_any_solves:
+                raise ValidationError(_('You must solve at least one problem before you can create a ticket.'))
         return super(TicketForm, self).clean()
 
 
@@ -88,6 +90,10 @@ class NewProblemTicketView(ProblemMixin, TitleMixin, NewTicketView):
     template_name = 'ticket/new_problem.html'
 
     def get_assignees(self):
+        if self.request.in_contest:
+            contest = self.request.participation.contest
+            if self.object.contests.filter(contest=contest).exists():
+                return contest.authors.all()
         return self.object.authors.all()
 
     def get_title(self):
@@ -108,7 +114,7 @@ class TicketCommentForm(forms.Form):
     body = forms.CharField(widget=ticket_widget)
 
 
-class TicketMixin(object):
+class TicketMixin(LoginRequiredMixin):
     model = Ticket
 
     def get_object(self, queryset=None):
@@ -126,7 +132,7 @@ class TicketMixin(object):
         raise PermissionDenied()
 
 
-class TicketView(TitleMixin, LoginRequiredMixin, TicketMixin, SingleObjectFormView):
+class TicketView(TitleMixin, TicketMixin, SingleObjectFormView):
     form_class = TicketCommentForm
     template_name = 'ticket/ticket.html'
     context_object_name = 'ticket'
@@ -158,7 +164,7 @@ class TicketView(TitleMixin, LoginRequiredMixin, TicketMixin, SingleObjectFormVi
         return context
 
 
-class TicketStatusChangeView(LoginRequiredMixin, TicketMixin, SingleObjectMixin, View):
+class TicketStatusChangeView(TicketMixin, SingleObjectMixin, View):
     open = None
 
     def post(self, request, *args, **kwargs):
@@ -185,7 +191,7 @@ class TicketNotesForm(forms.Form):
     notes = forms.CharField(widget=forms.Textarea(), required=False)
 
 
-class TicketNotesEditView(LoginRequiredMixin, TicketMixin, SingleObjectFormView):
+class TicketNotesEditView(TicketMixin, SingleObjectFormView):
     template_name = 'ticket/edit-notes.html'
     form_class = TicketNotesForm
     context_object_name = 'ticket'
@@ -214,12 +220,8 @@ class TicketList(LoginRequiredMixin, ListView):
     paginator_class = DiggPaginator
 
     @cached_property
-    def user(self):
-        return self.request.user
-
-    @cached_property
     def profile(self):
-        return self.user.profile
+        return self.request.profile
 
     @cached_property
     def can_edit_all(self):
@@ -243,10 +245,12 @@ class TicketList(LoginRequiredMixin, ListView):
 
     def get_queryset(self):
         queryset = self._get_queryset()
+        if self.GET_with_session('open'):
+            queryset = queryset.filter(is_open=True)
         if self.GET_with_session('own'):
             queryset = queryset.filter(own_ticket_filter(self.profile.id))
         elif not self.can_edit_all:
-            queryset = filter_visible_tickets(queryset, self.user, self.profile)
+            queryset = filter_visible_tickets(queryset, self.request.user)
         if self.filter_assignees:
             queryset = queryset.filter(assignees__user__username__in=self.filter_assignees)
         if self.filter_users:
@@ -263,7 +267,10 @@ class TicketList(LoginRequiredMixin, ListView):
         }
         context['can_edit_all'] = self.can_edit_all
         context['filter_status'] = {
-            'own': self.GET_with_session('own'), 'user': self.filter_users, 'assignee': self.filter_assignees,
+            'open': self.GET_with_session('open'),
+            'own': self.GET_with_session('own'),
+            'user': self.filter_users,
+            'assignee': self.filter_assignees,
             'user_id': json.dumps(list(Profile.objects.filter(user__username__in=self.filter_users)
                                        .values_list('id', flat=True))),
             'assignee_id': json.dumps(list(Profile.objects.filter(user__username__in=self.filter_assignees)
@@ -275,7 +282,7 @@ class TicketList(LoginRequiredMixin, ListView):
         return context
 
     def post(self, request, *args, **kwargs):
-        to_update = ('own',)
+        to_update = ('open', 'own')
         for key in to_update:
             if key in request.GET:
                 val = request.GET.get(key) == '1'
@@ -298,8 +305,8 @@ class ProblemTicketListView(TicketList):
 class TicketListDataAjax(TicketMixin, SingleObjectMixin, View):
     def get(self, request, *args, **kwargs):
         try:
-            self.kwargs['pk'] = request.GET['id']
-        except KeyError:
+            self.kwargs['pk'] = int(request.GET['id'])
+        except (KeyError, ValueError):
             return HttpResponseBadRequest()
         ticket = self.get_object()
         message = ticket.messages.first()
@@ -318,8 +325,8 @@ class TicketListDataAjax(TicketMixin, SingleObjectMixin, View):
 class TicketMessageDataAjax(TicketMixin, SingleObjectMixin, View):
     def get(self, request, *args, **kwargs):
         try:
-            message_id = request.GET['message']
-        except KeyError:
+            message_id = int(request.GET['message'])
+        except (KeyError, ValueError):
             return HttpResponseBadRequest()
         ticket = self.get_object()
         try:
@@ -327,7 +334,7 @@ class TicketMessageDataAjax(TicketMixin, SingleObjectMixin, View):
         except TicketMessage.DoesNotExist:
             return HttpResponseBadRequest()
         return JsonResponse({
-            'message': get_template('ticket/message.html').render({'message': message}, request),
+            'message': get_template('ticket/message.html').render({'message': message, 'ticket': ticket}, request),
             'notification': {
                 'title': _('New Ticket Message For: %s') % ticket.title,
                 'body': truncatechars(message.body, 200),

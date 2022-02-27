@@ -1,16 +1,15 @@
 from datetime import timedelta
 
 from django.core.exceptions import ValidationError
-from django.db import connection
+from django.db.models import Count, Max, OuterRef, Subquery
 from django.template.defaultfilters import floatformat
 from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
-from django.utils.translation import gettext_lazy
+from django.utils.translation import gettext as _, gettext_lazy, ngettext
 
 from judge.contest_format.default import DefaultContestFormat
 from judge.contest_format.registry import register_contest_format
-from judge.timezone import from_database_time
 from judge.utils.timedelta import nice_repr
 
 
@@ -19,12 +18,12 @@ class ECOOContestFormat(DefaultContestFormat):
     name = gettext_lazy('ECOO')
     config_defaults = {'cumtime': False, 'first_ac_bonus': 10, 'time_bonus': 5}
     config_validators = {'cumtime': lambda x: True, 'first_ac_bonus': lambda x: x >= 0, 'time_bonus': lambda x: x >= 0}
-    '''
+    """
         cumtime: Specify True if cumulative time is to be used in breaking ties. Defaults to False.
         first_ac_bonus: The number of points to award if a solution gets AC on its first non-IE/CE run. Defaults to 10.
         time_bonus: Number of minutes to award an extra point for submitting before the contest end.
                     Specify 0 to disable. Defaults to 5.
-    '''
+    """
 
     @classmethod
     def validate(cls, config):
@@ -49,49 +48,53 @@ class ECOOContestFormat(DefaultContestFormat):
 
     def update_participation(self, participation):
         cumtime = 0
-        points = 0
+        score = 0
         format_data = {}
 
-        with connection.cursor() as cursor:
-            cursor.execute('''
-            SELECT (
-                SELECT MAX(ccs.points)
-                    FROM judge_contestsubmission ccs LEFT OUTER JOIN
-                         judge_submission csub ON (csub.id = ccs.submission_id)
-                    WHERE ccs.problem_id = cp.id AND ccs.participation_id = %s AND csub.date = MAX(sub.date)
-            ) AS `score`, MAX(sub.date) AS `time`, cp.id AS `prob`, (
-                SELECT COUNT(ccs.id)
-                    FROM judge_contestsubmission ccs LEFT OUTER JOIN
-                         judge_submission csub ON (csub.id = ccs.submission_id)
-                    WHERE ccs.problem_id = cp.id AND ccs.participation_id = %s AND csub.result NOT IN ('IE', 'CE')
-            ) AS `subs`, cp.points AS `max_score`
-                FROM judge_contestproblem cp INNER JOIN
-                     judge_contestsubmission cs ON (cs.problem_id = cp.id AND cs.participation_id = %s) LEFT OUTER JOIN
-                     judge_submission sub ON (sub.id = cs.submission_id)
-                GROUP BY cp.id
-            ''', (participation.id, participation.id, participation.id))
+        submissions = participation.submissions.exclude(submission__result__in=('IE', 'CE'))
 
-            for score, time, prob, subs, max_score in cursor.fetchall():
-                time = from_database_time(time)
-                dt = (time - participation.start).total_seconds()
-                if self.config['cumtime']:
-                    cumtime += dt
+        submission_counts = {
+            data['problem_id']: data['count'] for data in submissions.values('problem_id').annotate(count=Count('id'))
+        }
+        queryset = (
+            submissions
+            .values('problem_id')
+            .filter(
+                submission__date=Subquery(
+                    submissions
+                    .filter(problem_id=OuterRef('problem_id'))
+                    .order_by('-submission__date')
+                    .values('submission__date')[:1],
+                ),
+            )
+            .annotate(points=Max('points'))
+            .values_list('problem_id', 'problem__points', 'points', 'submission__date')
+        )
 
-                bonus = 0
-                if score > 0:
-                    # First AC bonus
-                    if subs == 1 and score == max_score:
-                        bonus += self.config['first_ac_bonus']
-                    # Time bonus
-                    if self.config['time_bonus']:
-                        bonus += (participation.end_time - time).total_seconds() // 60 // self.config['time_bonus']
-                    points += bonus
+        for problem_id, problem_points, points, date in queryset:
+            sub_cnt = submission_counts.get(problem_id, 0)
 
-                format_data[str(prob)] = {'time': dt, 'points': score, 'bonus': bonus}
-                points += score
+            dt = (date - participation.start).total_seconds()
+
+            bonus = 0
+            if points > 0:
+                # First AC bonus
+                if sub_cnt == 1 and points == problem_points:
+                    bonus += self.config['first_ac_bonus']
+                # Time bonus
+                if self.config['time_bonus']:
+                    bonus += (participation.end_time - date).total_seconds() // 60 // self.config['time_bonus']
+
+            format_data[str(problem_id)] = {'time': dt, 'points': points, 'bonus': bonus}
+
+        for data in format_data.values():
+            if self.config['cumtime']:
+                cumtime += data['time']
+            score += data['points'] + data['bonus']
 
         participation.cumtime = cumtime
-        participation.score = points
+        participation.score = round(score, self.contest.points_precision)
+        participation.tiebreaker = 0
         participation.format_data = format_data
         participation.save()
 
@@ -116,7 +119,31 @@ class ECOOContestFormat(DefaultContestFormat):
 
     def display_participation_result(self, participation):
         return format_html(
-            '<td class="user-points">{points}<div class="solving-time">{cumtime}</div></td>',
-            points=floatformat(participation.score),
+            '<td class="user-points"><a href="{url}">{points}<div class="solving-time">{cumtime}</div></a></td>',
+            url=reverse('contest_all_user_submissions',
+                        args=[self.contest.key, participation.user.user.username]),
+            points=floatformat(participation.score, -self.contest.points_precision),
             cumtime=nice_repr(timedelta(seconds=participation.cumtime), 'noday') if self.config['cumtime'] else '',
         )
+
+    def get_short_form_display(self):
+        yield _('The score on your **last** non-CE submission for each problem will be used.')
+
+        first_ac_bonus = self.config['first_ac_bonus']
+        if first_ac_bonus:
+            yield _(
+                'There is a **%d bonus** for fully solving on your first non-CE submission.',
+            ) % first_ac_bonus
+
+        time_bonus = self.config['time_bonus']
+        if time_bonus:
+            yield ngettext(
+                'For every **%d minute** you submit before the end of your window, there will be a **1** point bonus.',
+                'For every **%d minutes** you submit before the end of your window, there will be a **1** point bonus.',
+                time_bonus,
+            ) % time_bonus
+
+        if self.config['cumtime']:
+            yield _('Ties will be broken by the sum of the last submission time on **all** problems.')
+        else:
+            yield _('Ties by score will **not** be broken.')

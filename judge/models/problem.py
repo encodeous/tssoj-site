@@ -3,12 +3,14 @@ from operator import attrgetter
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericRelation
 from django.core.cache import cache
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
-from django.db.models import CASCADE, F, QuerySet, SET_NULL
+from django.db.models import CASCADE, F, Q, QuerySet, SET_NULL
 from django.db.models.expressions import RawSQL
 from django.db.models.functions import Coalesce
 from django.urls import reverse
+from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 
@@ -18,8 +20,15 @@ from judge.models.runtime import Language
 from judge.user_translations import gettext as user_gettext
 from judge.utils.raw_sql import RawSQLColumn, unique_together_left_join
 
-__all__ = ['ProblemGroup', 'ProblemType', 'Problem', 'ProblemTranslation', 'ProblemClarification',
-           'License', 'Solution', 'TranslatedProblemQuerySet', 'TranslatedProblemForeignKeyQuerySet']
+__all__ = ['ProblemGroup', 'ProblemType', 'Problem', 'ProblemTranslation', 'ProblemClarification', 'License',
+           'Solution', 'SubmissionSourceAccess', 'TranslatedProblemQuerySet', 'TranslatedProblemForeignKeyQuerySet']
+
+
+def disallowed_characters_validator(text):
+    common_disallowed_characters = set(text) & settings.DMOJ_PROBLEM_STATEMENT_DISALLOWED_CHARACTERS
+    if common_disallowed_characters:
+        raise ValidationError(_('Disallowed characters: %(value)s'),
+                              params={'value': ''.join(common_disallowed_characters)})
 
 
 class ProblemType(models.Model):
@@ -92,7 +101,21 @@ class TranslatedProblemForeignKeyQuerySet(QuerySet):
         return queryset.annotate(**kwargs)
 
 
+class SubmissionSourceAccess:
+    ALWAYS = 'A'
+    SOLVED = 'S'
+    ONLY_OWN = 'O'
+    FOLLOW = 'F'
+
+
 class Problem(models.Model):
+    SUBMISSION_SOURCE_ACCESS = (
+        (SubmissionSourceAccess.FOLLOW, _('Follow global setting')),
+        (SubmissionSourceAccess.ALWAYS, _('Always visible')),
+        (SubmissionSourceAccess.SOLVED, _('Visible if problem solved')),
+        (SubmissionSourceAccess.ONLY_OWN, _('Only own submissions')),
+    )
+
     code = models.CharField(max_length=20, verbose_name=_('problem code'), unique=True,
                             validators=[RegexValidator('^[a-z0-9]+$', _('Problem code must be ^[a-z0-9]+$'))],
                             help_text=_('A short, unique code for the problem, '
@@ -100,7 +123,7 @@ class Problem(models.Model):
     name = models.CharField(max_length=100, verbose_name=_('problem name'), db_index=True,
                             help_text=_('The full name of the problem, '
                                         'as shown in the problem list.'))
-    description = models.TextField(verbose_name=_('problem body'))
+    description = models.TextField(verbose_name=_('problem body'), validators=[disallowed_characters_validator])
     authors = models.ManyToManyField(Profile, verbose_name=_('creators'), blank=True, related_name='authored_problems',
                                      help_text=_('These users will be able to edit the problem, '
                                                  'and be listed as authors.'))
@@ -148,6 +171,10 @@ class Problem(models.Model):
     user_count = models.IntegerField(verbose_name=_('number of users'), default=0,
                                      help_text=_('The number of users who solved the problem.'))
     ac_rate = models.FloatField(verbose_name=_('solve rate'), default=0)
+    is_full_markup = models.BooleanField(verbose_name=_('allow full markdown access'), default=False)
+    submission_source_visibility_mode = models.CharField(verbose_name=_('submission source visibility'), max_length=1,
+                                                         default=SubmissionSourceAccess.FOLLOW,
+                                                         choices=SUBMISSION_SOURCE_ACCESS)
 
     objects = TranslatedProblemQuerySet.as_manager()
     tickets = GenericRelation('Ticket')
@@ -175,11 +202,26 @@ class Problem(models.Model):
     def is_editable_by(self, user):
         if not user.is_authenticated:
             return False
+        if not user.has_perm('judge.edit_own_problem'):
+            return False
         if user.has_perm('judge.edit_all_problem') or user.has_perm('judge.edit_public_problem') and self.is_public:
             return True
-        return user.has_perm('judge.edit_own_problem') and self.is_editor(user.profile)
+        if user.profile.id in self.editor_ids:
+            return True
+        if self.is_organization_private and self.organizations.filter(admins=user.profile).exists():
+            return True
+        return False
 
-    def is_accessible_by(self, user):
+    def is_accessible_by(self, user, skip_contest_problem_check=False):
+        # If we don't want to check if the user is in a contest containing that problem.
+        if not skip_contest_problem_check and user.is_authenticated:
+            # If user is currently in a contest containing that problem.
+            current = user.profile.current_contest_id
+            if current is not None:
+                from judge.models import ContestProblem
+                if ContestProblem.objects.filter(problem_id=self.id, contest__users__id=current).exists():
+                    return True
+
         # Problem is public.
         if self.is_public:
             # Problem is not private to an organization.
@@ -195,30 +237,86 @@ class Problem(models.Model):
                     self.organizations.filter(id__in=user.profile.organizations.all()):
                 return True
 
+        if not user.is_authenticated:
+            return False
+
         # If the user can view all problems.
         if user.has_perm('judge.see_private_problem'):
             return True
 
-        if not user.is_authenticated:
-            return False
-
-        # If the user authored the problem or is a curator.
-        if user.has_perm('judge.edit_own_problem') and self.is_editor(user.profile):
+        # If the user can edit the problem.
+        # We are using self.editor_ids to take advantage of caching.
+        if self.is_editable_by(user) or user.profile.id in self.editor_ids:
             return True
 
         # If user is a tester.
         if self.testers.filter(id=user.profile.id).exists():
             return True
 
-        # If user is currently in a contest containing that problem.
-        current = user.profile.current_contest_id
-        if current is None:
-            return False
-        from judge.models import ContestProblem
-        return ContestProblem.objects.filter(problem_id=self.id, contest__users__id=current).exists()
+        return False
 
     def is_subs_manageable_by(self, user):
         return user.is_staff and user.has_perm('judge.rejudge_submission') and self.is_editable_by(user)
+
+    @classmethod
+    def get_visible_problems(cls, user):
+        # Do unauthenticated check here so we can skip authentication checks later on.
+        if not user.is_authenticated:
+            return cls.get_public_problems()
+
+        # Conditions for visible problem:
+        #   - `judge.edit_all_problem` or `judge.see_private_problem`
+        #   - otherwise
+        #       - not is_public problems
+        #           - author or curator or tester
+        #           - is_organization_private and admin of organization
+        #       - is_public problems
+        #           - not is_organization_private or in organization or `judge.see_organization_problem`
+        #           - author or curator or tester
+        queryset = cls.objects.defer('description')
+
+        edit_own_problem = user.has_perm('judge.edit_own_problem')
+        edit_public_problem = edit_own_problem and user.has_perm('judge.edit_public_problem')
+        edit_all_problem = edit_own_problem and user.has_perm('judge.edit_all_problem')
+
+        if not (user.has_perm('judge.see_private_problem') or edit_all_problem):
+            q = Q(is_public=True)
+            if not (user.has_perm('judge.see_organization_problem') or edit_public_problem):
+                # Either not organization private or in the organization.
+                q &= (
+                    Q(is_organization_private=False) |
+                    Q(is_organization_private=True, organizations__in=user.profile.organizations.all())
+                )
+
+            if edit_own_problem:
+                q |= Q(is_organization_private=True, organizations__in=user.profile.admin_of.all())
+
+            # Authors, curators, and testers should always have access, so OR at the very end.
+            q |= Q(authors=user.profile)
+            q |= Q(curators=user.profile)
+            q |= Q(testers=user.profile)
+            queryset = queryset.filter(q)
+
+        return queryset
+
+    @classmethod
+    def get_public_problems(cls):
+        return cls.objects.filter(is_public=True, is_organization_private=False).defer('description')
+
+    @classmethod
+    def get_editable_problems(cls, user):
+        if not user.has_perm('judge.edit_own_problem'):
+            return cls.objects.none()
+        if user.has_perm('judge.edit_all_problem'):
+            return cls.objects.all()
+
+        q = Q(authors=user.profile) | Q(curators=user.profile)
+        q |= Q(is_organization_private=True, organizations__in=user.profile.admin_of.all())
+
+        if user.has_perm('judge.edit_public_problem'):
+            q |= Q(is_public=True)
+
+        return cls.objects.filter(q)
 
     def __str__(self):
         return self.name
@@ -228,15 +326,16 @@ class Problem(models.Model):
 
     @cached_property
     def author_ids(self):
-        return self.authors.values_list('id', flat=True)
+        return Problem.authors.through.objects.filter(problem=self).values_list('profile_id', flat=True)
 
     @cached_property
     def editor_ids(self):
-        return self.author_ids | self.curators.values_list('id', flat=True)
+        return self.author_ids.union(
+            Problem.curators.through.objects.filter(problem=self).values_list('profile_id', flat=True))
 
     @cached_property
     def tester_ids(self):
-        return self.testers.values_list('id', flat=True)
+        return Problem.testers.through.objects.filter(problem=self).values_list('profile_id', flat=True)
 
     @cached_property
     def usable_common_names(self):
@@ -271,13 +370,23 @@ class Problem(models.Model):
     def clarifications(self):
         return ProblemClarification.objects.filter(problem=self)
 
+    @cached_property
+    def submission_source_visibility(self):
+        if self.submission_source_visibility_mode == SubmissionSourceAccess.FOLLOW:
+            return {
+                'all': SubmissionSourceAccess.ALWAYS,
+                'all-solved': SubmissionSourceAccess.SOLVED,
+                'only-own': SubmissionSourceAccess.ONLY_OWN,
+            }[settings.DMOJ_SUBMISSION_SOURCE_VISIBILITY]
+        return self.submission_source_visibility_mode
+
     def update_stats(self):
-        self.user_count = self.submission_set.filter(points__gte=self.points, result='AC',
-                                                     user__is_unlisted=False).values('user').distinct().count()
-        submissions = self.submission_set.count()
+        all_queryset = self.submission_set.filter(user__is_unlisted=False)
+        ac_queryset = all_queryset.filter(points__gte=self.points, result='AC')
+        self.user_count = ac_queryset.values('user').distinct().count()
+        submissions = all_queryset.count()
         if submissions:
-            self.ac_rate = 100.0 * self.submission_set.filter(points__gte=self.points, result='AC',
-                                                              user__is_unlisted=False).count() / submissions
+            self.ac_rate = 100.0 * ac_queryset.count() / submissions
         else:
             self.ac_rate = 0
         self.save()
@@ -326,6 +435,10 @@ class Problem(models.Model):
         cache.set(key, result)
         return result
 
+    @property
+    def markdown_style(self):
+        return 'problem-full' if self.is_full_markup else 'problem'
+
     def save(self, *args, **kwargs):
         super(Problem, self).save(*args, **kwargs)
         if self.code != self.__original_code:
@@ -340,14 +453,15 @@ class Problem(models.Model):
 
     class Meta:
         permissions = (
-            ('see_private_problem', 'See hidden problems'),
-            ('edit_own_problem', 'Edit own problems'),
-            ('edit_all_problem', 'Edit all problems'),
-            ('edit_public_problem', 'Edit all public problems'),
-            ('clone_problem', 'Clone problem'),
-            ('change_public_visibility', 'Change is_public field'),
-            ('change_manually_managed', 'Change is_manually_managed field'),
-            ('see_organization_problem', 'See organization-private problems'),
+            ('see_private_problem', _('See hidden problems')),
+            ('edit_own_problem', _('Edit own problems')),
+            ('edit_all_problem', _('Edit all problems')),
+            ('edit_public_problem', _('Edit all public problems')),
+            ('problem_full_markup', _('Edit problems with full markup')),
+            ('clone_problem', _('Clone problem')),
+            ('change_public_visibility', _('Change is_public field')),
+            ('change_manually_managed', _('Change is_manually_managed field')),
+            ('see_organization_problem', _('See organization-private problems')),
         )
         verbose_name = _('problem')
         verbose_name_plural = _('problems')
@@ -357,7 +471,8 @@ class ProblemTranslation(models.Model):
     problem = models.ForeignKey(Problem, verbose_name=_('problem'), related_name='translations', on_delete=CASCADE)
     language = models.CharField(verbose_name=_('language'), max_length=7, choices=settings.LANGUAGES)
     name = models.CharField(verbose_name=_('translated name'), max_length=100, db_index=True)
-    description = models.TextField(verbose_name=_('translated description'))
+    description = models.TextField(verbose_name=_('translated description'),
+                                   validators=[disallowed_characters_validator])
 
     class Meta:
         unique_together = ('problem', 'language')
@@ -367,7 +482,7 @@ class ProblemTranslation(models.Model):
 
 class ProblemClarification(models.Model):
     problem = models.ForeignKey(Problem, verbose_name=_('clarified problem'), on_delete=CASCADE)
-    description = models.TextField(verbose_name=_('clarification body'))
+    description = models.TextField(verbose_name=_('clarification body'), validators=[disallowed_characters_validator])
     date = models.DateTimeField(verbose_name=_('clarification timestamp'), auto_now_add=True)
 
 
@@ -393,7 +508,7 @@ class Solution(models.Model):
     is_public = models.BooleanField(verbose_name=_('public visibility'), default=False)
     publish_on = models.DateTimeField(verbose_name=_('publish date'))
     authors = models.ManyToManyField(Profile, verbose_name=_('authors'), blank=True)
-    content = models.TextField(verbose_name=_('editorial content'))
+    content = models.TextField(verbose_name=_('editorial content'), validators=[disallowed_characters_validator])
 
     def get_absolute_url(self):
         problem = self.problem
@@ -405,9 +520,18 @@ class Solution(models.Model):
     def __str__(self):
         return _('Editorial for %s') % self.problem.name
 
+    def is_accessible_by(self, user):
+        if self.is_public and self.publish_on < timezone.now():
+            return True
+        if user.has_perm('judge.see_private_solution'):
+            return True
+        if self.problem.is_editable_by(user):
+            return True
+        return False
+
     class Meta:
         permissions = (
-            ('see_private_solution', 'See hidden solutions'),
+            ('see_private_solution', _('See hidden solutions')),
         )
         verbose_name = _('solution')
         verbose_name_plural = _('solutions')

@@ -2,25 +2,22 @@ from collections import defaultdict
 from math import e
 
 from django.core.cache import cache
-from django.db.models import Case, Count, ExpressionWrapper, F, Max, Q, When
+from django.db.models import Case, Count, ExpressionWrapper, F, Max, When
 from django.db.models.fields import FloatField
 from django.utils import timezone
 from django.utils.translation import gettext as _, gettext_noop
 
 from judge.models import Problem, Submission
 
-__all__ = ['contest_completed_ids', 'get_result_data', 'user_completed_ids', 'user_authored_ids', 'user_editable_ids']
+__all__ = ['contest_completed_ids', 'get_result_data', 'user_completed_ids', 'user_editable_ids', 'user_tester_ids']
 
 
-def user_authored_ids(profile):
-    result = set(Problem.objects.filter(authors=profile).values_list('id', flat=True))
-    return result
+def user_tester_ids(profile):
+    return set(Problem.testers.through.objects.filter(profile=profile).values_list('problem_id', flat=True))
 
 
 def user_editable_ids(profile):
-    result = set((Problem.objects.filter(authors=profile) | Problem.objects.filter(curators=profile))
-                 .values_list('id', flat=True))
-    return result
+    return set(Problem.get_editable_problems(profile.user).values_list('id', flat=True))
 
 
 def contest_completed_ids(participation):
@@ -73,7 +70,7 @@ def _get_result_data(results):
     return {
         'categories': [
             # Using gettext_noop here since this will be tacked into the cache, so it must be language neutral.
-            # The caller, SubmissionList.get_result_data will run ugettext on the name.
+            # The caller, SubmissionList.get_result_data will run gettext on the name.
             {'code': 'AC', 'name': gettext_noop('Accepted'), 'count': results['AC']},
             {'code': 'WA', 'name': gettext_noop('Wrong'), 'count': results['WA']},
             {'code': 'CE', 'name': gettext_noop('Compile Error'), 'count': results['CE']},
@@ -96,24 +93,12 @@ def get_result_data(*args, **kwargs):
     return _get_result_data(defaultdict(int, raw))
 
 
-def editable_problems(user, profile=None):
-    subquery = Problem.objects.all()
-    if profile is None:
-        profile = user.profile
-    if not user.has_perm('judge.edit_all_problem'):
-        subfilter = Q(authors__id=profile.id) | Q(curators__id=profile.id)
-        if user.has_perm('judge.edit_public_problem'):
-            subfilter |= Q(is_public=True)
-        subquery = subquery.filter(subfilter)
-    return subquery
-
-
 def hot_problems(duration, limit):
     cache_key = 'hot_problems:%d:%d' % (duration.total_seconds(), limit)
     qs = cache.get(cache_key)
     if qs is None:
-        qs = Problem.objects.filter(is_public=True, is_organization_private=False,
-                                    submission__date__gt=timezone.now() - duration, points__gt=3, points__lt=25)
+        qs = Problem.get_public_problems() \
+                    .filter(submission__date__gt=timezone.now() - duration, points__gt=3, points__lt=25)
         qs0 = qs.annotate(k=Count('submission__user', distinct=True)).order_by('-k').values_list('k', flat=True)
 
         if not qs0:

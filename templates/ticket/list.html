@@ -75,7 +75,7 @@
     <script type="text/javascript" src="{{ static('event.js') }}"></script>
     <script type="text/javascript">
         $(function () {
-            $('input#own').click(function () {
+            $('input#open, input#own').click(function () {
                 ($('<form>').attr('action', window.location.pathname + '?' + $('form#filter-form').serialize())
                     .append($('<input>').attr('type', 'hidden').attr('name', 'csrfmiddlewaretoken')
                         .attr('value', $.cookie('csrftoken')))
@@ -167,9 +167,6 @@
             };
 
             var user_select2 = {
-                escapeMarkup: function (markup) {
-                    return markup;
-                },
                 templateResult: function (data, container) {
                     return $('<span>')
                         .append($('<img>', {
@@ -213,6 +210,9 @@
 {% endblock %}
 
 {% block body %}
+    {% if page_obj.has_other_pages() %}
+        <div class="top-pagination-bar">{% include "list-pages.html" %}</div>
+    {% endif %}
     <div id="container">
         <aside>
             <div>
@@ -222,6 +222,11 @@
                 </div>
 
                 <form id="filter-form" name="form" action="" method="get">
+                    <div id="open-box" class="filter-check">
+                        <input id="open" type="checkbox" name="open"{% if filter_status.open %} checked{% endif %} value="1">
+                        <label for="open">{{ _('Hide closed tickets') }}</label>
+                    </div>
+
                     <div id="own-box" class="filter-check">
                         <input id="own" type="checkbox" name="own"{% if filter_status.own %} checked{% endif %} value="1">
                         <label for="own">{{ _('Show my tickets only') }}</label>
@@ -251,28 +256,27 @@
         </aside>
 
         <main>
-            {% if page_obj.num_pages > 1 %}
-                <div style="margin-bottom:6px; margin-top:3px">{% include "list-pages.html" %}</div>
-            {% endif %}
-            <table id="ticket-list" class="table">
-                <thead>
-                <tr>
-                    <th></th>
-                    <th>{{ _('ID') }}</th>
-                    <th>{{ _('Title') }}</th>
-                    <th>{{ _('User') }}</th>
-                    <th>{{ _('Assignees') }}</th>
-                </tr>
-                </thead>
-                <tbody>
-                {% for ticket in tickets %}
-                    {% include "ticket/row.html" %}
-                {% endfor %}
-                </tbody>
-            </table>
-            {% if page_obj.num_pages > 1 %}
-                <div style="margin-top:10px">{% include "list-pages.html" %}</div>
-            {% endif %}
+            <div class="h-scrollable-table">
+                <table id="ticket-list" class="table">
+                    <thead>
+                    <tr>
+                        <th></th>
+                        <th>{{ _('ID') }}</th>
+                        <th>{{ _('Title') }}</th>
+                        <th>{{ _('User') }}</th>
+                        <th>{{ _('Assignees') }}</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    {% for ticket in tickets %}
+                        {% include "ticket/row.html" %}
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
         </main>
     </div>
+    {% if page_obj.has_other_pages() %}
+        <div class="bottom-pagination-bar">{% include "list-pages.html" %}</div>
+    {% endif %}
 {% endblock %}

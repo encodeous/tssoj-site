@@ -5,11 +5,13 @@ from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
 from django.urls import reverse
+from django.utils import timezone
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
+from reversion import revisions
 
 from judge.judgeapi import abort_submission, judge_submission
-from judge.models.problem import Problem, TranslatedProblemForeignKeyQuerySet
+from judge.models.problem import Problem, SubmissionSourceAccess, TranslatedProblemForeignKeyQuerySet
 from judge.models.profile import Profile
 from judge.models.runtime import Language
 from judge.utils.unicode import utf8bytes
@@ -31,6 +33,7 @@ SUBMISSION_RESULT = (
 )
 
 
+@revisions.register(follow=['test_cases'])
 class Submission(models.Model):
     STATUS = (
         ('QU', _('Queued')),
@@ -46,7 +49,7 @@ class Submission(models.Model):
     USER_DISPLAY_CODES = {
         'AC': _('Accepted'),
         'WA': _('Wrong Answer'),
-        'SC': "Short Circuited",
+        'SC': 'Short Circuited',
         'TLE': _('Time Limit Exceeded'),
         'MLE': _('Memory Limit Exceeded'),
         'OLE': _('Output Limit Exceeded'),
@@ -78,10 +81,12 @@ class Submission(models.Model):
     case_total = models.FloatField(verbose_name=_('test case total points'), default=0)
     judged_on = models.ForeignKey('Judge', verbose_name=_('judged on'), null=True, blank=True,
                                   on_delete=models.SET_NULL)
-    was_rejudged = models.BooleanField(verbose_name=_('was rejudged by admin'), default=False)
+    judged_date = models.DateTimeField(verbose_name=_('submission judge time'), default=None, null=True)
+    rejudged_date = models.DateTimeField(verbose_name=_('last rejudge date by admin'), null=True, blank=True)
     is_pretested = models.BooleanField(verbose_name=_('was ran on pretests only'), default=False)
     contest_object = models.ForeignKey('Contest', verbose_name=_('contest'), null=True, blank=True,
                                        on_delete=models.SET_NULL, related_name='+')
+    locked_after = models.DateTimeField(verbose_name=_('submission lock'), null=True, blank=True)
 
     objects = TranslatedProblemForeignKeyQuerySet.as_manager()
 
@@ -112,8 +117,19 @@ class Submission(models.Model):
     def long_status(self):
         return Submission.USER_DISPLAY_CODES.get(self.short_status, '')
 
-    def judge(self, rejudge=False, batch_rejudge=False):
-        judge_submission(self, rejudge, batch_rejudge)
+    @cached_property
+    def is_locked(self):
+        return self.locked_after is not None and self.locked_after < timezone.now()
+
+    def judge(self, *args, rejudge=False, force_judge=False, rejudge_user=None, **kwargs):
+        if force_judge or not self.is_locked:
+            if rejudge:
+                with revisions.create_revision(manage_manually=True):
+                    if rejudge_user:
+                        revisions.set_user(rejudge_user)
+                    revisions.set_comment('Rejudged')
+                    revisions.add_to_revision(self)
+            judge_submission(self, *args, rejudge=rejudge, **kwargs)
 
     judge.alters_data = True
 
@@ -121,6 +137,39 @@ class Submission(models.Model):
         abort_submission(self)
 
     abort.alters_data = True
+
+    def can_see_detail(self, user):
+        if not user.is_authenticated:
+            return False
+        profile = user.profile
+        source_visibility = self.problem.submission_source_visibility
+        if self.problem.is_editable_by(user):
+            return True
+        elif user.has_perm('judge.view_all_submission'):
+            return True
+        elif self.user_id == profile.id:
+            return True
+        elif source_visibility == SubmissionSourceAccess.ALWAYS:
+            return True
+        elif source_visibility == SubmissionSourceAccess.SOLVED and \
+                (self.problem.is_public or self.problem.testers.filter(id=profile.id).exists()) and \
+                self.problem.submission_set.filter(user_id=profile.id, result='AC',
+                                                   points=self.problem.points).exists():
+            return True
+        elif source_visibility == SubmissionSourceAccess.ONLY_OWN and \
+                self.problem.testers.filter(id=profile.id).exists():
+            return True
+
+        contest = self.contest_object
+        # If user is an author or curator of the contest the submission was made in, or they can see in-contest subs
+        if contest is not None and (
+            user.profile.id in contest.editor_ids or
+            contest.view_contest_submissions.filter(id=user.profile.id).exists() or
+            (contest.tester_see_submissions and user.profile.id in contest.tester_ids)
+        ):
+            return True
+
+        return False
 
     def update_contest(self):
         try:
@@ -186,12 +235,13 @@ class Submission(models.Model):
 
     class Meta:
         permissions = (
-            ('abort_any_submission', 'Abort any submission'),
-            ('rejudge_submission', 'Rejudge the submission'),
-            ('rejudge_submission_lot', 'Rejudge a lot of submissions'),
-            ('spam_submission', 'Submit without limit'),
-            ('view_all_submission', 'View all submission'),
-            ('resubmit_other', "Resubmit others' submission"),
+            ('abort_any_submission', _('Abort any submission')),
+            ('rejudge_submission', _('Rejudge the submission')),
+            ('rejudge_submission_lot', _('Rejudge a lot of submissions')),
+            ('spam_submission', _('Submit without limit')),
+            ('view_all_submission', _('View all submission')),
+            ('resubmit_other', _("Resubmit others' submission")),
+            ('lock_submission', _('Change lock status of submission')),
         )
         verbose_name = _('submission')
         verbose_name_plural = _('submissions')
@@ -206,6 +256,7 @@ class SubmissionSource(models.Model):
         return 'Source of %s' % self.submission
 
 
+@revisions.register()
 class SubmissionTestCase(models.Model):
     RESULT = SUBMISSION_RESULT
 

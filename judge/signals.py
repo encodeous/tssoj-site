@@ -5,12 +5,12 @@ from django.conf import settings
 from django.contrib.sites.models import Site
 from django.core.cache import cache
 from django.core.cache.utils import make_template_fragment_key
-from django.db.models.signals import post_delete, post_save
+from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
 
 from .caching import finished_submission
 from .models import BlogPost, Comment, Contest, ContestSubmission, EFFECTIVE_MATH_ENGINES, Judge, Language, License, \
-    MiscConfig, Organization, Problem, Profile, Submission
+    MiscConfig, Organization, Problem, Profile, Submission, WebAuthnCredential
 
 
 def get_pdf_path(basename):
@@ -54,6 +54,14 @@ def profile_update(sender, instance, **kwargs):
                        for engine in EFFECTIVE_MATH_ENGINES] +
                       [make_template_fragment_key('org_member_count', (org_id,))
                        for org_id in instance.organizations.values_list('id', flat=True)])
+
+
+@receiver(post_delete, sender=WebAuthnCredential)
+def webauthn_delete(sender, instance, **kwargs):
+    profile = instance.user
+    if profile.webauthn_credentials.count() == 0:
+        profile.is_webauthn_enabled = False
+        profile.save(update_fields=['is_webauthn_enabled'])
 
 
 @receiver(post_save, sender=Contest)
@@ -101,13 +109,17 @@ def post_update(sender, instance, **kwargs):
 @receiver(post_delete, sender=Submission)
 def submission_delete(sender, instance, **kwargs):
     finished_submission(instance)
+    instance.user._updating_stats_only = True
     instance.user.calculate_points()
+    instance.problem._updating_stats_only = True
+    instance.problem.update_stats()
 
 
 @receiver(post_delete, sender=ContestSubmission)
 def contest_submission_delete(sender, instance, **kwargs):
     participation = instance.participation
     participation.recompute_results()
+    Submission.objects.filter(id=instance.submission_id).update(contest_object=None)
 
 
 @receiver(post_save, sender=Organization)
@@ -120,11 +132,31 @@ _misc_config_i18n = [code for code, _ in settings.LANGUAGES]
 _misc_config_i18n.append('')
 
 
-@receiver(post_save, sender=MiscConfig)
-def misc_config_update(sender, instance, **kwargs):
-    cache.delete_many(['misc_config:%s:%s:%s' % (domain, lang, instance.key.split('.')[0])
+def misc_config_cache_delete(key):
+    cache.delete_many(['misc_config:%s:%s:%s' % (domain, lang, key.split('.')[0])
                        for lang in _misc_config_i18n
                        for domain in Site.objects.values_list('domain', flat=True)])
+
+
+@receiver(pre_save, sender=MiscConfig)
+def misc_config_pre_save(sender, instance, **kwargs):
+    try:
+        old_key = MiscConfig.objects.filter(id=instance.id).values_list('key').get()[0]
+    except MiscConfig.DoesNotExist:
+        old_key = None
+    instance._old_key = old_key
+
+
+@receiver(post_save, sender=MiscConfig)
+def misc_config_update(sender, instance, **kwargs):
+    misc_config_cache_delete(instance.key)
+    if instance._old_key is not None and instance._old_key != instance.key:
+        misc_config_cache_delete(instance._old_key)
+
+
+@receiver(post_delete, sender=MiscConfig)
+def misc_config_delete(sender, instance, **kwargs):
+    misc_config_cache_delete(instance.key)
 
 
 @receiver(post_save, sender=ContestSubmission)

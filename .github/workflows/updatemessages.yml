@@ -1,9 +1,10 @@
 name: updatemessages
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 0 * * *'
 jobs:
   updatemessages:
+    if: github.repository == 'DMOJ/online-judge'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v2
@@ -22,6 +23,11 @@ jobs:
         sudo dpkg -i crowdin.deb
         pip install -r requirements.txt
         pip install pymysql
+    - name: Update English source strings
+      run: |
+        echo "STATIC_ROOT = '/tmp'" > dmoj/local_settings.py
+        python manage.py makemessages -l en -e py,html,txt
+        python manage.py makemessages -l en -d djangojs
     - name: Download strings from Crowdin
       env:
         CROWDIN_API_TOKEN: ${{ secrets.CROWDIN_API_TOKEN }}
@@ -54,13 +60,31 @@ jobs:
         git add locale
         git checkout .
         git clean -fd
+        git reset
+    - name: Remove useless changes
+      run: |
+        set -eu
+        while IFS= read -r -d $'\0' file; do
+          if git diff -s --exit-code "$file"; then
+            continue
+          fi
+
+          if git diff "$file" | tail -n +5 2>/dev/null | grep -qP '^[-+](?!"PO-Revision-Date:|"POT-Creation-Date:)'; then
+            echo "Changed: $file"
+          else
+            echo "No material change: $file"
+            git checkout "$file" > /dev/null 2>&1
+          fi
+        done < <(git ls-files -z 'locale/*/LC_MESSAGES/*.po')
     - name: Create pull request
-      uses: peter-evans/create-pull-request@v2
+      uses: peter-evans/create-pull-request@v3
       with:
         token: ${{ secrets.REPO_SCOPED_TOKEN }}
+        author: dmoj-build <build@dmoj.ca>
+        committer: dmoj-build <build@dmoj.ca>
         commit-message: 'i18n: update translations from Crowdin'
-        title: 'Update translations from Crowdin'
+        title: Update translations from Crowdin
         body: This PR has been auto-generated to pull in latest translations from [Crowdin](https://translate.dmoj.ca).
         labels: i18n, enhancement
-        assignees: Xyene, quantum5
+        reviewers: Xyene, quantum5
         branch: update-i18n

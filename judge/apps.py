@@ -14,23 +14,11 @@ class JudgeAppConfig(AppConfig):
         # noinspection PyUnresolvedReferences
         from . import signals, jinja2  # noqa: F401, imported for side effects
 
-        from django.contrib.flatpages.models import FlatPage
-        from django.contrib.flatpages.admin import FlatPageAdmin
-        from django.contrib import admin
-
-        from reversion.admin import VersionAdmin
-
-        class FlatPageVersionAdmin(VersionAdmin, FlatPageAdmin):
-            pass
-
-        admin.site.unregister(FlatPage)
-        admin.site.register(FlatPage, FlatPageVersionAdmin)
-
         from judge.models import Language, Profile
         from django.contrib.auth.models import User
 
         try:
-            lang = Language.get_python3()
+            lang = Language.get_default_language()
             for user in User.objects.filter(profile=None):
                 # These poor profileless users
                 profile = Profile(user=user, language=lang)

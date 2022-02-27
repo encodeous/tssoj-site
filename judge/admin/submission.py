@@ -10,7 +10,8 @@ from django.db.models import Q
 from django.http import HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils.html import format_html
-from django.utils.translation import gettext, gettext_lazy as _, pgettext, ungettext
+from django.utils.translation import gettext, gettext_lazy as _, ngettext, pgettext
+from reversion.admin import VersionAdmin
 
 from django_ace import AceWidget
 from judge.models import ContestParticipation, ContestProblem, ContestSubmission, Profile, Submission, \
@@ -77,9 +78,13 @@ class ContestSubmissionInline(admin.StackedInline):
             if db_field.name == 'participation':
                 kwargs['queryset'] = ContestParticipation.objects.filter(user=submission.user,
                                                                          contest__problems=submission.problem) \
-                    .only('id', 'contest__name')
+                    .only('id', 'contest__name', 'virtual')
 
                 def label(obj):
+                    if obj.spectate:
+                        return gettext('%s (spectating)') % obj.contest.name
+                    if obj.virtual:
+                        return gettext('%s (virtual %d)') % (obj.contest.name, obj.virtual)
                     return obj.contest.name
             elif db_field.name == 'problem':
                 kwargs['queryset'] = ContestProblem.objects.filter(problem=submission.problem) \
@@ -107,10 +112,10 @@ class SubmissionSourceInline(admin.StackedInline):
         return super().get_formset(request, obj, **kwargs)
 
 
-class SubmissionAdmin(admin.ModelAdmin):
-    readonly_fields = ('user', 'problem', 'date')
-    fields = ('user', 'problem', 'date', 'time', 'memory', 'points', 'language', 'status', 'result',
-              'case_points', 'case_total', 'judged_on', 'error')
+class SubmissionAdmin(VersionAdmin):
+    readonly_fields = ('user', 'problem', 'date', 'judged_date')
+    fields = ('user', 'problem', 'date', 'judged_date', 'locked_after', 'time', 'memory', 'points', 'language',
+              'status', 'result', 'case_points', 'case_total', 'judged_on', 'error')
     actions = ('judge', 'recalculate_score')
     list_display = ('id', 'problem_code', 'problem_name', 'user_column', 'execution_time', 'pretty_memory',
                     'points', 'language_column', 'status', 'result', 'judge_column')
@@ -119,6 +124,12 @@ class SubmissionAdmin(admin.ModelAdmin):
     actions_on_top = True
     actions_on_bottom = True
     inlines = [SubmissionSourceInline, SubmissionTestCaseInline, ContestSubmissionInline]
+
+    def get_readonly_fields(self, request, obj=None):
+        fields = self.readonly_fields
+        if not request.user.has_perm('judge.lock_submission'):
+            fields += ('locked_after',)
+        return fields
 
     def get_queryset(self, request):
         queryset = Submission.objects.select_related('problem', 'user__user', 'language').only(
@@ -160,10 +171,10 @@ class SubmissionAdmin(admin.ModelAdmin):
             queryset = queryset.filter(Q(problem__authors__id=id) | Q(problem__curators__id=id))
         judged = len(queryset)
         for model in queryset:
-            model.judge(rejudge=True, batch_rejudge=True)
-        self.message_user(request, ungettext('%d submission was successfully scheduled for rejudging.',
-                                             '%d submissions were successfully scheduled for rejudging.',
-                                             judged) % judged)
+            model.judge(rejudge=True, batch_rejudge=True, rejudge_user=request.user)
+        self.message_user(request, ngettext('%d submission was successfully scheduled for rejudging.',
+                                            '%d submissions were successfully scheduled for rejudging.',
+                                            judged) % judged)
     judge.short_description = _('Rejudge the selected submissions')
 
     def recalculate_score(self, request, queryset):
@@ -190,9 +201,9 @@ class SubmissionAdmin(admin.ModelAdmin):
                 id__in=queryset.values_list('contest__participation_id')).prefetch_related('contest'):
             participation.recompute_results()
 
-        self.message_user(request, ungettext('%d submission were successfully rescored.',
-                                             '%d submissions were successfully rescored.',
-                                             len(submissions)) % len(submissions))
+        self.message_user(request, ngettext('%d submission were successfully rescored.',
+                                            '%d submissions were successfully rescored.',
+                                            len(submissions)) % len(submissions))
     recalculate_score.short_description = _('Rescore the selected submissions')
 
     def problem_code(self, obj):
@@ -232,7 +243,10 @@ class SubmissionAdmin(admin.ModelAdmin):
     language_column.short_description = _('Language')
 
     def judge_column(self, obj):
-        return format_html('<input type="button" value="Rejudge" onclick="location.href=\'{}/judge/\'" />', obj.id)
+        if obj.is_locked:
+            return format_html('<input type="button" disabled value="Locked"/>')
+        else:
+            return format_html('<input type="button" value="Rejudge" onclick="location.href=\'{}/judge/\'" />', obj.id)
     judge_column.short_description = ''
 
     def get_urls(self):
@@ -247,5 +261,5 @@ class SubmissionAdmin(admin.ModelAdmin):
         if not request.user.has_perm('judge.edit_all_problem') and \
                 not submission.problem.is_editor(request.profile):
             raise PermissionDenied()
-        submission.judge(rejudge=True)
+        submission.judge(rejudge=True, rejudge_user=request.user)
         return HttpResponseRedirect(request.META.get('HTTP_REFERER', '/'))

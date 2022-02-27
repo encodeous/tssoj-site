@@ -5,8 +5,10 @@ import struct
 import zlib
 
 from django.conf import settings
+from django.utils import timezone
 
 from judge import event_poster as event
+from judge.judge_priority import BATCH_REJUDGE_PRIORITY, CONTEST_SUBMISSION_PRIORITY, DEFAULT_PRIORITY, REJUDGE_PRIORITY
 
 logger = logging.getLogger('judge.judgeapi')
 size_pack = struct.Struct('!I')
@@ -48,21 +50,16 @@ def judge_request(packet, reply=True):
         return result
 
 
-def judge_submission(submission, rejudge, batch_rejudge=False):
+def judge_submission(submission, rejudge=False, batch_rejudge=False, judge_id=None):
     from .models import ContestSubmission, Submission, SubmissionTestCase
 
-    CONTEST_SUBMISSION_PRIORITY = 0
-    DEFAULT_PRIORITY = 1
-    REJUDGE_PRIORITY = 2
-    BATCH_REJUDGE_PRIORITY = 3
-
-    updates = {'time': None, 'memory': None, 'points': None, 'result': None, 'error': None,
-               'was_rejudged': rejudge, 'status': 'QU'}
+    updates = {'time': None, 'memory': None, 'points': None, 'result': None, 'case_points': 0, 'case_total': 0,
+               'error': None, 'rejudged_date': timezone.now() if rejudge or batch_rejudge else None, 'status': 'QU'}
     try:
         # This is set proactively; it might get unset in judgecallback's on_grading_begin if the problem doesn't
         # actually have pretests stored on the judge.
-        updates['is_pretested'] = ContestSubmission.objects.filter(submission=submission) \
-            .values_list('problem__contest__run_pretests_only', flat=True)[0]
+        updates['is_pretested'] = all(ContestSubmission.objects.filter(submission=submission)
+                                      .values_list('problem__contest__run_pretests_only', 'problem__is_pretested')[0])
     except IndexError:
         priority = DEFAULT_PRIORITY
     else:
@@ -88,15 +85,16 @@ def judge_submission(submission, rejudge, batch_rejudge=False):
             'problem-id': submission.problem.code,
             'language': submission.language.key,
             'source': submission.source.source,
-            'priority': BATCH_REJUDGE_PRIORITY if batch_rejudge else REJUDGE_PRIORITY if rejudge else priority,
+            'judge-id': judge_id,
+            'priority': BATCH_REJUDGE_PRIORITY if batch_rejudge else (REJUDGE_PRIORITY if rejudge else priority),
         })
     except BaseException:
         logger.exception('Failed to send request to judge')
-        Submission.objects.filter(id=submission.id).update(status='IE')
+        Submission.objects.filter(id=submission.id).update(status='IE', result='IE')
         success = False
     else:
         if response['name'] != 'submission-received' or response['submission-id'] != submission.id:
-            Submission.objects.filter(id=submission.id).update(status='IE')
+            Submission.objects.filter(id=submission.id).update(status='IE', result='IE')
         _post_update_submission(submission)
         success = True
     return success
@@ -108,10 +106,14 @@ def disconnect_judge(judge, force=False):
 
 def abort_submission(submission):
     from .models import Submission
+    # We only want to try to abort a submission if it's still grading, otherwise this can lead to fully graded
+    # submissions marked as aborted.
+    if submission.status == 'D':
+        return
     response = judge_request({'name': 'terminate-submission', 'submission-id': submission.id})
-    # This defaults to true, so that in the case the judgelist fails to remove the submission from the queue,
+    # This defaults to true, so that in the case the JudgeList fails to remove the submission from the queue,
     # and returns a bad-request, the submission is not falsely shown as "Aborted" when it will still be judged.
     if not response.get('judge-aborted', True):
-        Submission.objects.filter(id=submission.id).update(status='AB', result='AB')
+        Submission.objects.filter(id=submission.id).update(status='AB', result='AB', points=0)
         event.post('sub_%s' % Submission.get_id_secret(submission.id), {'type': 'aborted-submission'})
         _post_update_submission(submission, done=True)

@@ -2,18 +2,18 @@
 {% block js_media %}
     <script type="text/javascript">
         {% if dynamic_update and last_msg %}
-            {% if request.in_contest %}
-                window.current_contest = '{{request.participation.contest.key}}';
+            {% if dynamic_contest_id %}
+                window.dynamic_contest_id = {{ dynamic_contest_id }};
             {% else %}
-                window.current_contest = null;
+                window.dynamic_contest_id = null;
             {% endif %}
             {% if dynamic_user_id %}
-                window.dynamic_user_id = {{dynamic_user_id}};
+                window.dynamic_user_id = {{ dynamic_user_id }};
             {% else %}
                 window.dynamic_user_id = null;
             {% endif %}
             {% if dynamic_problem_id %}
-                window.dynamic_problem_id = {{dynamic_problem_id}};
+                window.dynamic_problem_id = {{ dynamic_problem_id }};
             {% else %}
                 window.dynamic_problem_id = null;
             {% endif %}
@@ -157,7 +157,7 @@
                         first = id;
                         row = $('<div>', {id: id, 'class': 'submission-row'}).hide().prependTo(table);
                         if (table.find('>div').length >= {{ paginator.per_page }})
-                            table.find('>div:last-child').hide('slow', function () {
+                            table.find('>div:last-child').slideUp('slow', function () {
                                 $(this).remove();
                             });
                     }
@@ -212,10 +212,9 @@
                 var receiver = new EventReceiver(
                     "{{ EVENT_DAEMON_LOCATION }}", "{{ EVENT_DAEMON_POLL_LOCATION }}",
                     ['submissions'], last_msg, function (message) {
-                        if (current_contest && message.contest != current_contest)
-                            return;
                         if (dynamic_user_id && message.user != dynamic_user_id ||
-                            dynamic_problem_id && message.problem != dynamic_problem_id)
+                            dynamic_problem_id && message.problem != dynamic_problem_id ||
+                            dynamic_contest_id && message.contest != dynamic_contest_id)
                             return;
                         if (message.type == 'update-submission') {
                             if (message.state == 'test-case' && $body.hasClass('window-hidden'))
@@ -296,10 +295,8 @@
 {% endblock %}
 
 {% block body %}
-    {% if page_obj.num_pages > 1 %}
-        <div style="margin-bottom: 6px; margin-top: 11px">
-            {% include "list-pages.html" %}
-        </div>
+    {% if page_obj.has_other_pages() %}
+        <div class="top-pagination-bar">{% include "list-pages.html" %}</div>
     {% endif %}
 
     <div id="common-content">
@@ -308,7 +305,7 @@
                 <div class="sidebox">
                     <h3>{{ _('Filter submissions') }} <i class="fa fa-search"></i></h3>
                     <div class="sidebox-content">
-                        <form id="filter-form" name="form" action="" method="get">
+                        <form id="filter-form" name="form" action="{{ first_page_href }}" method="get">
                             <div class="filter-form-group">
                                 <label for="status"><i>{{ _('Status') }}</i></label>
                                 <select id="status" name="status" multiple>
@@ -359,17 +356,17 @@
                 {% set profile_id = request.profile.id if request.user.is_authenticated else 0 %}
                 {% for submission in submissions %}
                     <div class="submission-row" id="{{ submission.id }}">
-                        {% with problem_name=show_problem and submission.problem.i18n_name %}
+                        {% with problem_name=show_problem and (submission.problem.i18n_name or submission.problem.name) %}
                             {% include "submission/row.html" %}
                         {% endwith %}
                     </div>
                 {% endfor %}
             </div>
-            {% if page_obj.num_pages > 1 %}
-                <div style="margin-top:10px;">{% include "list-pages.html" %}</div>
-            {% endif %}
         </div>
     </div>
+    {% if page_obj.has_other_pages() %}
+        <div class="bottom-pagination-bar">{% include "list-pages.html" %}</div>
+    {% endif %}
 {% endblock %}
 
 {% block bodyend %}

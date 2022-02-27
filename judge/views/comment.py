@@ -1,10 +1,10 @@
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
 from django.core.exceptions import PermissionDenied
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError
 from django.db.models import F
 from django.forms.models import ModelForm
-from django.http import Http404, HttpResponse, HttpResponseBadRequest, HttpResponseForbidden
+from django.http import Http404, HttpResponse, HttpResponseBadRequest, HttpResponseForbidden, HttpResponseNotFound
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext as _
 from django.views.decorators.http import require_POST
@@ -29,20 +29,23 @@ def vote_comment(request, delta):
     if request.method != 'POST':
         return HttpResponseForbidden()
 
-    if 'id' not in request.POST:
+    if 'id' not in request.POST or len(request.POST['id']) > 10:
         return HttpResponseBadRequest()
 
-    if not request.user.is_staff and not request.profile.submission_set.filter(points=F('problem__points')).exists():
+    if not request.user.is_staff and not request.profile.has_any_solves:
         return HttpResponseBadRequest(_('You must solve at least one problem before you can vote.'),
                                       content_type='text/plain')
+
+    if request.profile.mute:
+        return HttpResponseBadRequest(_('Your part is silent, little toad.'), content_type='text/plain')
 
     try:
         comment_id = int(request.POST['id'])
     except ValueError:
         return HttpResponseBadRequest()
     else:
-        if not Comment.objects.filter(id=comment_id).exists():
-            raise Http404()
+        if not Comment.objects.filter(id=comment_id, hidden=False).exists():
+            return HttpResponseNotFound(_('Comment not found.'), content_type='text/plain')
 
     vote = CommentVote()
     vote.comment_id = comment_id
@@ -82,6 +85,12 @@ class CommentMixin(object):
     pk_url_kwarg = 'id'
     context_object_name = 'comment'
 
+    def get_object(self, queryset=None):
+        comment = super().get_object(queryset)
+        if not comment.is_accessible_by(self.request.user):
+            raise Http404()
+        return comment
+
 
 class CommentRevisionAjax(CommentMixin, DetailView):
     template_name = 'comments/revision-ajax.html'
@@ -116,7 +125,7 @@ class CommentEditAjax(LoginRequiredMixin, CommentMixin, UpdateView):
     form_class = CommentEditForm
 
     def form_valid(self, form):
-        with transaction.atomic(), revisions.create_revision():
+        with revisions.create_revision(atomic=True):
             revisions.set_comment(_('Edited from site'))
             revisions.set_user(self.request.user)
             return super(CommentEditAjax, self).form_valid(form)
@@ -147,7 +156,7 @@ class CommentContent(CommentMixin, DetailView):
 
 class CommentVotesAjax(PermissionRequiredMixin, CommentMixin, DetailView):
     template_name = 'comments/votes.html'
-    permission_required = 'judge.change_commentvote'
+    permission_required = 'judge.change_comment'
 
     def get_context_data(self, **kwargs):
         context = super(CommentVotesAjax, self).get_context_data(**kwargs)

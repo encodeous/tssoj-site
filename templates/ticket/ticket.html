@@ -24,13 +24,15 @@
             width: 100%;
             margin: 0 auto;
             display: flex;
-            flex-direction: row-reverse;
+            flex-direction: row;
+            flex-wrap: wrap-reverse;
             max-width: 1000px;
         }
 
         .ticket-sidebar {
             flex: 1;
             padding: 10px 0 0 10px;
+            min-width: 150px;
             max-width: 200px;
         }
 
@@ -47,6 +49,10 @@
             margin: 5px 0 10px;
             border: 1px #999 solid;
             border-radius: 5px;
+        }
+
+        .info-box .fa {
+            color: #777;
         }
 
         .info-title {
@@ -104,8 +110,7 @@
 
         .message {
             display: flex;
-            margin-top: -40px;
-            padding-top: 55px;
+            padding-top: 15px;
         }
 
         .message .info {
@@ -122,14 +127,11 @@
             margin: 0 auto;
         }
 
-        .message .message-date, .message .message-time {
-            display: inline-block;
-        }
-
         .message .detail {
             border: 1px #999 solid;
             border-radius: 5px;
             flex: 1;
+            min-width: 200px;
         }
 
         .message .header {
@@ -137,8 +139,19 @@
             color: #777;
             border-bottom: 1px solid #999;
             border-radius: 5px 5px 0 0;
-            padding: 2px 7px;
+            padding: 2px 5px;
             text-align: right;
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+        }
+
+        .message .operation {
+            flex: auto;
+        }
+
+        .message .operation .fa {
+            color: #777;
         }
 
         .message .content {
@@ -316,6 +329,35 @@
 
 {% block body %}
     <div class="container">
+        <div class="ticket-messages">
+            <main id="messages">
+                {% for message in ticket_messages %}
+                    {% include "ticket/message.html" %}
+                {% endfor %}
+            </main>
+            <hr>
+            <section class="message new-message">
+                <div class="info">
+                    <a href="{{ url('user_page', request.user.username) }}" class="user">
+                        <img src="{{ gravatar(request.user, 135) }}" class="gravatar">
+                        <div class="username {{ request.profile.css_class }}">{{ request.profile.display_name }}</div>
+                    </a>
+                </div>
+                <div class="detail">
+                    <form action="" method="post">
+                        {% csrf_token %}
+                        {% if form.non_field_errors() or form.body.errors %}
+                            <div class="form-errors">
+                                {{ form.non_field_errors() }}
+                                {{ form.body.errors }}
+                            </div>
+                        {% endif %}
+                        <div class="body-block">{{ form.body }}</div>
+                        <button type="submit" class="submit">{{ _('Post') }}</button>
+                    </form>
+                </div>
+            </section>
+        </div>
         <aside class="ticket-sidebar">
             <div class="ticket-info">
                 <div class="info-box">
@@ -325,7 +367,13 @@
                     </div>
                 </div>
                 <div class="info-box">
-                    <div class="info-title">{{ _('Assignees') }}</div>
+                    <div class="info-title">
+                        {% trans trimmed count=assignees|length %}
+                            Assignee
+                        {% pluralize %}
+                            Assignees
+                        {% endtrans %}
+                    </div>
                     <div class="info-data">
                         {% if assignees %}
                             {{ link_users(assignees) }}
@@ -357,39 +405,11 @@
                 {% endif %}
             </div>
         </aside>
-
-        <div class="ticket-messages">
-            <main id="messages" class="messages">
-                {% for message in ticket_messages %}
-                    {% include "ticket/message.html" %}
-                {% endfor %}
-            </main>
-            <hr>
-            <section class="message new-message">
-                <div class="info">
-                    <a href="{{ url('user_page') }}" class="user">
-                        <img src="{{ gravatar(request.user, 135) }}" class="gravatar">
-                        <div class="username {{ request.profile.css_class }}">{{ request.user.username }}</div>
-                    </a>
-                </div>
-                <div class="detail">
-                    <form action="" method="post">
-                        {% csrf_token %}
-                        {% if form.non_field_errors() or form.body.errors %}
-                            <div class="form-errors">
-                                {{ form.non_field_errors() }}
-                                {{ form.body.errors }}
-                            </div>
-                        {% endif %}
-                        <div class="body-block">{{ form.body }}</div>
-                        <button type="submit" class="submit">{{ _('Post') }}</button>
-                    </form>
-                </div>
-            </section>
-        </div>
     </div>
 {% endblock %}
 
 {% block bodyend %}
-    {% if REQUIRE_JAX %}{% include "mathjax-load.html" %}{% endif %}
+    {% if REQUIRE_JAX %}
+        {% include "mathjax-load.html" %}
+    {% endif %}
 {% endblock %}

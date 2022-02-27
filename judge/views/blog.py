@@ -1,10 +1,9 @@
 from django.conf import settings
-from django.db.models import Count, Max, Q
+from django.db.models import Count, Max
 from django.http import Http404
 from django.urls import reverse
 from django.utils import timezone
-from django.utils.functional import lazy
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext as _
 from django.views.generic import ListView
 
 from judge.comments import CommentedDetailView
@@ -45,8 +44,8 @@ class PostList(ListView):
         context['first_page_href'] = reverse('home')
         context['page_prefix'] = reverse('blog_post_list')
         context['comments'] = Comment.most_recent(self.request.user, 10)
-        context['new_problems'] = Problem.objects.filter(is_public=True, is_organization_private=False) \
-                                         .order_by('-date', '-id')[:settings.DMOJ_BLOG_NEW_PROBLEM_COUNT]
+        context['new_problems'] = Problem.get_public_problems() \
+                                         .order_by('-date', 'code')[:settings.DMOJ_BLOG_NEW_PROBLEM_COUNT]
         context['page_titles'] = CacheDict(lambda page: Comment.get_page_title(page))
 
         context['has_clarifications'] = False
@@ -57,10 +56,10 @@ class PostList(ListView):
                 context['has_clarifications'] = clarifications.count() > 0
                 context['clarifications'] = clarifications.order_by('-date')
 
-        context['user_count'] = lazy(Profile.objects.count, int, int)
-        context['problem_count'] = lazy(Problem.objects.filter(is_public=True).count, int, int)
-        context['submission_count'] = lazy(Submission.objects.count, int, int)
-        context['language_count'] = lazy(Language.objects.count, int, int)
+        context['user_count'] = Profile.objects.count
+        context['problem_count'] = Problem.get_public_problems().count
+        context['submission_count'] = lambda: Submission.objects.aggregate(max_id=Max('id'))['max_id'] or 0
+        context['language_count'] = Language.objects.count
 
         context['post_comment_counts'] = {
             int(page[2:]): count for page, count in
@@ -81,28 +80,25 @@ class PostList(ListView):
                                                       .order_by('-latest')
                                                       [:settings.DMOJ_BLOG_RECENTLY_ATTEMPTED_PROBLEMS_COUNT])
 
-        visible_contests = Contest.objects.filter(is_visible=True).order_by('start_time')
-        q = Q(is_private=False, is_organization_private=False)
-        if self.request.user.is_authenticated:
-            q |= Q(is_organization_private=True, organizations__in=user.organizations.all())
-            q |= Q(is_private=True, private_contestants=user)
-        visible_contests = visible_contests.filter(q)
+        visible_contests = Contest.get_visible_contests(self.request.user).filter(is_visible=True) \
+                                  .order_by('start_time')
+
         context['current_contests'] = visible_contests.filter(start_time__lte=now, end_time__gt=now)
         context['future_contests'] = visible_contests.filter(start_time__gt=now)
 
         if self.request.user.is_authenticated:
-            profile = self.request.profile
-            context['own_open_tickets'] = (Ticket.objects.filter(user=profile, is_open=True).order_by('-id')
-                                           .prefetch_related('linked_item').select_related('user__user'))
+            context['own_open_tickets'] = (
+                Ticket.objects.filter(user=self.request.profile, is_open=True).order_by('-id')
+                              .prefetch_related('linked_item').select_related('user__user')
+            )
         else:
-            profile = None
             context['own_open_tickets'] = []
 
         # Superusers better be staffs, not the spell-casting kind either.
         if self.request.user.is_staff:
             tickets = (Ticket.objects.order_by('-id').filter(is_open=True).prefetch_related('linked_item')
                              .select_related('user__user'))
-            context['open_tickets'] = filter_visible_tickets(tickets, self.request.user, profile)[:10]
+            context['open_tickets'] = filter_visible_tickets(tickets, self.request.user)[:10]
         else:
             context['open_tickets'] = []
         return context

@@ -1,5 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.models import User
+from django.contrib.flatpages.admin import FlatPageAdmin as OldFlatPageAdmin, FlatpageForm as OldFlatpageForm
 from django.forms import ModelForm
 from django.urls import NoReverseMatch, reverse, reverse_lazy
 from django.utils.html import format_html
@@ -8,8 +9,8 @@ from mptt.admin import DraggableMPTTAdmin
 from reversion.admin import VersionAdmin
 
 from judge.dblock import LockModel
-from judge.models import NavigationBar
-from judge.widgets import AdminHeavySelect2MultipleWidget, AdminHeavySelect2Widget, HeavyPreviewAdminPageDownWidget
+from judge.models import BlogPost, NavigationBar
+from judge.widgets import AdminHeavySelect2MultipleWidget, AdminHeavySelect2Widget, AdminMartorWidget
 
 
 class NavigationBarAdmin(DraggableMPTTAdmin):
@@ -41,25 +42,33 @@ class NavigationBarAdmin(DraggableMPTTAdmin):
         return result
 
 
+class FlatpageForm(OldFlatpageForm):
+    class Meta(OldFlatpageForm.Meta):
+        widgets = {'content': AdminMartorWidget(attrs={'data-markdownfy-url': reverse_lazy('flatpage_preview')})}
+
+
+class FlatPageAdmin(VersionAdmin, OldFlatPageAdmin):
+    form = FlatpageForm
+
+
 class BlogPostForm(ModelForm):
     def __init__(self, *args, **kwargs):
         super(BlogPostForm, self).__init__(*args, **kwargs)
-        self.fields['authors'].widget.can_add_related = False
+        if 'authors' in self.fields:
+            # self.fields['authors'] does not exist when the user has only view permission on the model.
+            self.fields['authors'].widget.can_add_related = False
 
     class Meta:
         widgets = {
             'authors': AdminHeavySelect2MultipleWidget(data_view='profile_select2', attrs={'style': 'width: 100%'}),
-            'organizations': AdminHeavySelect2MultipleWidget(data_view='organization_select2', attrs={'style': 'width: 100%'}),
+            'content': AdminMartorWidget(attrs={'data-markdownfy-url': reverse_lazy('blog_preview')}),
+            'summary': AdminMartorWidget(attrs={'data-markdownfy-url': reverse_lazy('blog_preview')}),
         }
-
-        if HeavyPreviewAdminPageDownWidget is not None:
-            widgets['content'] = HeavyPreviewAdminPageDownWidget(preview=reverse_lazy('blog_preview'))
-            widgets['summary'] = HeavyPreviewAdminPageDownWidget(preview=reverse_lazy('blog_preview'))
 
 
 class BlogPostAdmin(VersionAdmin):
     fieldsets = (
-        (None, {'fields': ('title', 'slug', 'authors', 'visible', 'sticky', 'publish_on', 'is_organization_private', 'organizations')}),
+        (None, {'fields': ('title', 'slug', 'authors', 'visible', 'sticky', 'publish_on')}),
         (_('Content'), {'fields': ('content', 'og_image')}),
         (_('Summary'), {'classes': ('collapse',), 'fields': ('summary',)}),
     )
@@ -71,10 +80,20 @@ class BlogPostAdmin(VersionAdmin):
     date_hierarchy = 'publish_on'
 
     def has_change_permission(self, request, obj=None):
-        return (request.user.has_perm('judge.edit_all_post') or
-                request.user.has_perm('judge.change_blogpost') and (
-                    obj is None or
-                    obj.authors.filter(id=request.profile.id).exists()))
+        if obj is None:
+            return request.user.has_perm('judge.change_blogpost')
+        return obj.is_editable_by(request.user)
+
+    def get_readonly_fields(self, request, obj=None):
+        if not request.user.has_perm('judge.change_post_visibility'):
+            return ['visible']
+        return []
+
+    def get_queryset(self, request):
+        queryset = BlogPost.objects.all()
+        if not request.user.has_perm('judge.edit_all_post'):
+            queryset = queryset.filter(authors=request.profile)
+        return queryset
 
 
 class SolutionForm(ModelForm):
@@ -86,16 +105,13 @@ class SolutionForm(ModelForm):
         widgets = {
             'authors': AdminHeavySelect2MultipleWidget(data_view='profile_select2', attrs={'style': 'width: 100%'}),
             'problem': AdminHeavySelect2Widget(data_view='problem_select2', attrs={'style': 'width: 250px'}),
+            'content': AdminMartorWidget(attrs={'data-markdownfy-url': reverse_lazy('solution_preview')}),
         }
-
-        if HeavyPreviewAdminPageDownWidget is not None:
-            widgets['content'] = HeavyPreviewAdminPageDownWidget(preview=reverse_lazy('solution_preview'))
 
 
 class LicenseForm(ModelForm):
     class Meta:
-        if HeavyPreviewAdminPageDownWidget is not None:
-            widgets = {'text': HeavyPreviewAdminPageDownWidget(preview=reverse_lazy('license_preview'))}
+        widgets = {'text': AdminMartorWidget(attrs={'data-markdownfy-url': reverse_lazy('license_preview')})}
 
 
 class LicenseAdmin(admin.ModelAdmin):

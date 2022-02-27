@@ -182,7 +182,9 @@ class ProblemDataCompiler(object):
 
         yml_file = '%s/init.yml' % self.problem.code
         try:
-            init = yaml.safe_dump(self.make_init())
+            init = self.make_init()
+            if init:
+                init = yaml.safe_dump(init)
         except ProblemDataError as e:
             self.data.feedback = e.message
             self.data.save()
@@ -190,7 +192,13 @@ class ProblemDataCompiler(object):
         else:
             self.data.feedback = ''
             self.data.save()
-            problem_data_storage.save(yml_file, ContentFile(init))
+            if init:
+                problem_data_storage.save(yml_file, ContentFile(init))
+            else:
+                # Don't write empty init.yml since we should be looking in manually managed
+                # judge-server#670 will not update cache on empty init.yml,
+                # but will do so if there is no init.yml, so we delete the init.yml
+                problem_data_storage.delete(yml_file)
 
     @classmethod
     def generate(cls, *args, **kwargs):

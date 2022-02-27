@@ -18,7 +18,6 @@ from judge.utils.recaptcha import ReCaptchaField, ReCaptchaWidget
 from judge.utils.subscription import Subscription, newsletter_id
 from judge.widgets import Select2MultipleWidget, Select2Widget
 
-valid_id = re.compile(r'^\w+$')
 bad_mail_regex = list(map(re.compile, settings.BAD_MAIL_PROVIDER_REGEX))
 
 
@@ -71,7 +70,7 @@ class RegistrationView(OldRegistrationView):
     def register(self, form):
         user = super(RegistrationView, self).register(form)
         profile, _ = Profile.objects.get_or_create(user=user, defaults={
-            'language': Language.get_python3(),
+            'language': Language.get_default_language(),
         })
 
         cleaned_data = form.cleaned_data

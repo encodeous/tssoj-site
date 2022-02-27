@@ -1,4 +1,6 @@
 import json
+from collections import namedtuple
+from itertools import groupby
 from operator import attrgetter
 
 from django.conf import settings
@@ -20,16 +22,25 @@ from django.views.generic import DetailView, ListView
 from judge import event_poster as event
 from judge.highlight_code import highlight_code
 from judge.models import Contest, Language, Problem, ProblemTranslation, Profile, Submission
-from judge.utils.problems import get_result_data, user_authored_ids, user_completed_ids, user_editable_ids
-from judge.utils.raw_sql import use_straight_join
-from judge.utils.views import DiggPaginatorMixin, TitleMixin
+from judge.models.problem import SubmissionSourceAccess
+from judge.utils.infinite_paginator import InfinitePaginationMixin
+from judge.utils.problems import get_result_data, user_completed_ids, user_editable_ids, user_tester_ids
+from judge.utils.raw_sql import join_sql_subquery, use_straight_join
+from judge.utils.views import DiggPaginatorMixin, TitleMixin, generic_message
 
 
 def submission_related(queryset):
     return queryset.select_related('user__user', 'problem', 'language') \
         .only('id', 'user__user__username', 'user__display_rank', 'user__rating', 'problem__name',
               'problem__code', 'problem__is_public', 'language__short_name', 'language__key', 'date', 'time', 'memory',
-              'points', 'result', 'status', 'case_points', 'case_total', 'current_testcase', 'contest_object')
+              'points', 'result', 'status', 'case_points', 'case_total', 'current_testcase', 'contest_object',
+              'locked_after', 'problem__submission_source_visibility_mode', 'user__username_display_override') \
+        .prefetch_related('contest_object__authors', 'contest_object__curators')
+
+
+class SubmissionPermissionDenied(PermissionDenied):
+    def __init__(self, submission):
+        self.submission = submission
 
 
 class SubmissionMixin(object):
@@ -41,25 +52,35 @@ class SubmissionMixin(object):
 class SubmissionDetailBase(LoginRequiredMixin, TitleMixin, SubmissionMixin, DetailView):
     def get_object(self, queryset=None):
         submission = super(SubmissionDetailBase, self).get_object(queryset)
-        profile = self.request.profile
+        if not submission.can_see_detail(self.request.user):
+            raise SubmissionPermissionDenied(submission)
+        return submission
+
+    def get(self, request, *args, **kwargs):
+        try:
+            return super().get(request, *args, **kwargs)
+        except SubmissionPermissionDenied as e:
+            return self.no_permission(e.submission)
+
+    def no_permission(self, submission):
         problem = submission.problem
-        if self.request.user.has_perm('judge.view_all_submission'):
-            return submission
-        if submission.user_id == profile.id:
-            return submission
-        if problem.is_editor(profile):
-            return submission
-        if problem.is_public or problem.testers.filter(id=profile.id).exists():
-            if Submission.objects.filter(user_id=profile.id, result='AC', problem_id=problem.id,
-                                         points=problem.points).exists():
-                return submission
-        raise PermissionDenied()
+        if problem.is_accessible_by(self.request.user) and \
+                problem.submission_source_visibility == SubmissionSourceAccess.SOLVED:
+
+            message = escape(_('Permission denied. Solve %(problem)s in order to view it.')) % {
+                'problem': format_html('<a href="{0}">{1}</a>',
+                                       reverse('problem_detail', args=[problem.code]),
+                                       problem.translated_name(self.request.LANGUAGE_CODE)),
+            }
+            return generic_message(self.request, _("Can't access submission"), mark_safe(message), status=403)
+        else:
+            return generic_message(self.request, _("Can't access submission"), _('Permission denied.'), status=403)
 
     def get_title(self):
         submission = self.object
         return _('Submission of %(problem)s by %(user)s') % {
             'problem': submission.problem.translated_name(self.request.LANGUAGE_CODE),
-            'user': submission.user.user.username,
+            'user': submission.user.display_name,
         }
 
     def get_content_title(self):
@@ -70,7 +91,7 @@ class SubmissionDetailBase(LoginRequiredMixin, TitleMixin, SubmissionMixin, Deta
                                    submission.problem.translated_name(self.request.LANGUAGE_CODE)),
             'user': format_html('<a href="{0}">{1}</a>',
                                 reverse('user_page', args=[submission.user.user.username]),
-                                submission.user.user.username),
+                                submission.user.display_name),
         })
 
 
@@ -97,19 +118,54 @@ def make_batch(batch, cases):
     return result
 
 
+TestCase = namedtuple('TestCase', 'id status batch num_combined')
+
+
+def get_statuses(batch, cases):
+    cases = [TestCase(id=case.id, status=case.status, batch=batch, num_combined=1) for case in cases]
+    if batch:
+        # Get the first non-AC case if it exists.
+        return [next((case for case in cases if case.status != 'AC'), cases[0])]
+    else:
+        return cases
+
+
+def combine_statuses(status_cases, submission):
+    ret = []
+    # If the submission is not graded and the final case is a batch,
+    # we don't actually know if it is completed or not, so just remove it.
+    if not submission.is_graded and len(status_cases) > 0 and status_cases[-1].batch is not None:
+        status_cases.pop()
+
+    for key, group in groupby(status_cases, key=attrgetter('status')):
+        group = list(group)
+        if len(group) > 10:
+            # Grab the first case's id so the user can jump to that case, and combine the rest.
+            ret.append(TestCase(id=group[0].id, status=key, batch=None, num_combined=len(group)))
+        else:
+            ret.extend(group)
+    return ret
+
+
 def group_test_cases(cases):
     result = []
+    status = []
     buf = []
+    max_execution_time = 0.0
     last = None
     for case in cases:
+        if case.time:
+            max_execution_time = max(max_execution_time, case.time)
         if case.batch != last and buf:
             result.append(make_batch(last, buf))
+            status.extend(get_statuses(last, buf))
             buf = []
         buf.append(case)
         last = case.batch
     if buf:
         result.append(make_batch(last, buf))
-    return result
+        status.extend(get_statuses(last, buf))
+    return result, status, max_execution_time
 
 
 class SubmissionStatus(SubmissionDetailBase):
@@ -119,7 +175,10 @@ class SubmissionStatus(SubmissionDetailBase):
         context = super(SubmissionStatus, self).get_context_data(**kwargs)
         submission = self.object
         context['last_msg'] = event.last()
-        context['batches'] = group_test_cases(submission.test_cases.all())
+
+        context['batches'], statuses, context['max_execution_time'] = group_test_cases(submission.test_cases.all())
+        context['statuses'] = combine_statuses(statuses, submission)
+
         context['time_limit'] = submission.problem.time_limit
         try:
             lang_limit = submission.problem.language_limits.get(language=submission.language)
@@ -149,11 +208,21 @@ class SubmissionSourceRaw(SubmissionSource):
 @require_POST
 def abort_submission(request, submission):
     submission = get_object_or_404(Submission, id=int(submission))
-    if (not request.user.is_authenticated or (submission.was_rejudged or (request.profile != submission.user)) and
-            not request.user.has_perm('abort_any_submission')):
+    if (not request.user.has_perm('judge.abort_any_submission') and
+       (submission.rejudged_date is not None or request.profile != submission.user)):
         raise PermissionDenied()
     submission.abort()
     return HttpResponseRedirect(reverse('submission_status', args=(submission.id,)))
+
+
+def filter_submissions_by_visible_problems(queryset, user):
+    join_sql_subquery(
+        queryset,
+        subquery=str(Problem.get_visible_problems(user).distinct().only('id').query),
+        params=[],
+        join_fields=[('problem_id', 'id')],
+        alias='visible_problems',
+    )
 
 
 class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
@@ -173,8 +242,10 @@ class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
             category['name'] = _(category['name'])
         return result
 
-    def _get_result_data(self):
-        return get_result_data(self.get_queryset().order_by())
+    def _get_result_data(self, queryset=None):
+        if queryset is None:
+            queryset = self.get_queryset()
+        return get_result_data(queryset.order_by())
 
     def access_check(self, request):
         pass
@@ -196,19 +267,34 @@ class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
                                                           queryset=ProblemTranslation.objects.filter(
                                                               language=self.request.LANGUAGE_CODE), to_attr='_trans'))
         if self.in_contest:
-            queryset = queryset.filter(contest__participation__contest_id=self.contest.id)
-            if self.contest.hide_scoreboard and self.contest.is_in_contest(self.request.user):
-                queryset = queryset.filter(contest__participation__user=self.request.profile)
+            queryset = queryset.filter(contest_object=self.contest)
+            if not self.contest.can_see_full_scoreboard(self.request.user):
+                queryset = queryset.filter(user=self.request.profile)
         else:
             queryset = queryset.select_related('contest_object').defer('contest_object__description')
 
-            # This is not technically correct since contest organizers *should* see these, but
-            # the join would be far too messy
             if not self.request.user.has_perm('judge.see_private_contest'):
-                queryset = queryset.exclude(contest_object_id__in=Contest.objects.filter(hide_scoreboard=True))
+                # Show submissions for any contest you can edit or where you can see submissions
+                contest_queryset = Contest.objects.filter(
+                    Q(authors=self.request.profile) |
+                    Q(curators=self.request.profile) |
+                    Q(tester_see_submissions=True, testers=self.request.profile) |
+                    Q(view_contest_submissions=self.request.profile) |
+                    Q(scoreboard_visibility=Contest.SCOREBOARD_VISIBLE) |
+                    Q(end_time__lt=timezone.now(), scoreboard_visibility__in=(
+                        Contest.SCOREBOARD_AFTER_PARTICIPATION,
+                        Contest.SCOREBOARD_AFTER_CONTEST,
+                    )),
+                ).distinct()
+
+                queryset = queryset.filter(
+                    Q(user=self.request.profile) |
+                    Q(contest_object__in=contest_queryset) |
+                    Q(contest_object__isnull=True),
+                )
 
         if self.selected_languages:
-            queryset = queryset.filter(language_id__in=Language.objects.filter(key__in=self.selected_languages))
+            queryset = queryset.filter(language__in=Language.objects.filter(key__in=self.selected_languages))
         if self.selected_statuses:
             queryset = queryset.filter(result__in=self.selected_statuses)
 
@@ -217,13 +303,8 @@ class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
     def get_queryset(self):
         queryset = self._get_queryset()
         if not self.in_contest:
-            if not self.request.user.has_perm('judge.see_private_problem'):
-                queryset = queryset.filter(problem__is_public=True)
-            if not self.request.user.has_perm('judge.see_organization_problem'):
-                filter = Q(problem__is_organization_private=False)
-                if self.request.user.is_authenticated:
-                    filter |= Q(problem__organizations__in=self.request.profile.organizations.all())
-                queryset = queryset.filter(filter)
+            filter_submissions_by_visible_problems(queryset, self.request.user)
+
         return queryset
 
     def get_my_submissions_page(self):
@@ -242,10 +323,11 @@ class SubmissionsListBase(DiggPaginatorMixin, TitleMixin, ListView):
         context = super(SubmissionsListBase, self).get_context_data(**kwargs)
         authenticated = self.request.user.is_authenticated
         context['dynamic_update'] = False
+        context['dynamic_contest_id'] = self.in_contest and self.contest.id
         context['show_problem'] = self.show_problem
         context['completed_problem_ids'] = user_completed_ids(self.request.profile) if authenticated else []
-        context['authored_problem_ids'] = user_authored_ids(self.request.profile) if authenticated else []
         context['editable_problem_ids'] = user_editable_ids(self.request.profile) if authenticated else []
+        context['tester_problem_ids'] = user_tester_ids(self.request.profile) if authenticated else []
 
         context['all_languages'] = Language.objects.all().values_list('key', 'name')
         context['selected_languages'] = self.selected_languages
@@ -287,13 +369,17 @@ class UserMixin(object):
 
 
 class ConditionalUserTabMixin(object):
+    @cached_property
+    def is_own(self):
+        return self.request.user.is_authenticated and self.request.profile == self.profile
+
     def get_context_data(self, **kwargs):
         context = super(ConditionalUserTabMixin, self).get_context_data(**kwargs)
-        if self.request.user.is_authenticated and self.request.profile == self.profile:
+        if self.is_own:
             context['tab'] = 'my_submissions_tab'
         else:
             context['tab'] = 'user_submissions_tab'
-            context['tab_username'] = self.profile.user.username
+            context['tab_username'] = self.profile.display_name
         return context
 
 
@@ -302,14 +388,14 @@ class AllUserSubmissions(ConditionalUserTabMixin, UserMixin, SubmissionsListBase
         return super(AllUserSubmissions, self).get_queryset().filter(user_id=self.profile.id)
 
     def get_title(self):
-        if self.request.user.is_authenticated and self.request.profile == self.profile:
+        if self.is_own:
             return _('All my submissions')
-        return _('All submissions by %s') % self.username
+        return _('All submissions by %s') % self.profile.display_name
 
     def get_content_title(self):
-        if self.request.user.is_authenticated and self.request.profile == self.profile:
+        if self.is_own:
             return format_html('All my submissions')
-        return format_html('All submissions by <a href="{1}">{0}</a>', self.username,
+        return format_html('All submissions by <a href="{1}">{0}</a>', self.profile.display_name,
                            reverse('user_page', args=[self.username]))
 
     def get_my_submissions_page(self):
@@ -342,10 +428,14 @@ class ProblemSubmissionsBase(SubmissionsListBase):
                            reverse('problem_detail', args=[self.problem.code]))
 
     def access_check_contest(self, request):
-        if self.in_contest and not self.contest.can_see_scoreboard(request.user):
+        if self.in_contest and not self.contest.can_see_own_scoreboard(request.user):
             raise Http404()
 
     def access_check(self, request):
+        # FIXME: This should be rolled into the `is_accessible_by` check when implementing #1509
+        if self.in_contest and request.user.is_authenticated and request.profile.id in self.contest.editor_ids:
+            return
+
         if not self.problem.is_accessible_by(request.user):
             raise Http404()
 
@@ -382,10 +472,6 @@ class ProblemSubmissions(ProblemSubmissionsBase):
 class UserProblemSubmissions(ConditionalUserTabMixin, UserMixin, ProblemSubmissions):
     check_contest_in_access_check = False
 
-    @cached_property
-    def is_own(self):
-        return self.request.user.is_authenticated and self.request.profile == self.profile
-
     def access_check(self, request):
         super(UserProblemSubmissions, self).access_check(request)
 
@@ -397,16 +483,18 @@ class UserProblemSubmissions(ConditionalUserTabMixin, UserMixin, ProblemSubmissi
 
     def get_title(self):
         if self.is_own:
-            return _("My submissions for %(problem)s") % {'problem': self.problem_name}
-        return _("%(user)s's submissions for %(problem)s") % {'user': self.username, 'problem': self.problem_name}
+            return _('My submissions for %(problem)s') % {'problem': self.problem_name}
+        return _("%(user)s's submissions for %(problem)s") % {
+            'user': self.profile.display_name, 'problem': self.problem_name,
+        }
 
     def get_content_title(self):
         if self.request.user.is_authenticated and self.request.profile == self.profile:
-            return format_html('''My submissions for <a href="{3}">{2}</a>''',
+            return format_html("""My submissions for <a href="{3}">{2}</a>""",
                                self.username, reverse('user_page', args=[self.username]),
                                self.problem_name, reverse('problem_detail', args=[self.problem.code]))
-        return format_html('''<a href="{1}">{0}</a>'s submissions for <a href="{3}">{2}</a>''',
-                           self.username, reverse('user_page', args=[self.username]),
+        return format_html("""<a href="{1}">{0}</a>'s submissions for <a href="{3}">{2}</a>""",
+                           self.profile.display_name, reverse('user_page', args=[self.username]),
                            self.problem_name, reverse('problem_detail', args=[self.problem.code]))
 
     def get_context_data(self, **kwargs):
@@ -415,26 +503,7 @@ class UserProblemSubmissions(ConditionalUserTabMixin, UserMixin, ProblemSubmissi
         return context
 
 
-def single_submission(request, submission_id, show_problem=True):
-    request.no_profile_update = True
-    authenticated = request.user.is_authenticated
-    submission = get_object_or_404(submission_related(Submission.objects.all()), id=int(submission_id))
-
-    if not submission.problem.is_accessible_by(request.user):
-        raise Http404()
-
-    return render(request, 'submission/row.html', {
-        'submission': submission,
-        'authored_problem_ids': user_authored_ids(request.profile) if authenticated else [],
-        'completed_problem_ids': user_completed_ids(request.profile) if authenticated else [],
-        'editable_problem_ids': user_editable_ids(request.profile) if authenticated else [],
-        'show_problem': show_problem,
-        'problem_name': show_problem and submission.problem.translated_name(request.LANGUAGE_CODE),
-        'profile_id': request.profile.id if authenticated else 0,
-    })
-
-
-def single_submission_query(request):
+def single_submission(request):
     request.no_profile_update = True
     if 'id' not in request.GET or not request.GET['id'].isdigit():
         return HttpResponseBadRequest()
@@ -442,11 +511,29 @@ def single_submission_query(request):
         show_problem = int(request.GET.get('show_problem', '1'))
     except ValueError:
         return HttpResponseBadRequest()
-    return single_submission(request, int(request.GET['id']), bool(show_problem))
+
+    authenticated = request.user.is_authenticated
+    submission = get_object_or_404(submission_related(Submission.objects.all()), id=int(request.GET['id']))
+    if not submission.problem.is_accessible_by(request.user):
+        raise Http404()
+
+    return render(request, 'submission/row.html', {
+        'submission': submission,
+        'completed_problem_ids': user_completed_ids(request.profile) if authenticated else [],
+        'editable_problem_ids': user_editable_ids(request.profile) if authenticated else [],
+        'tester_problem_ids': user_tester_ids(request.profile) if authenticated else [],
+        'show_problem': show_problem,
+        'problem_name': show_problem and submission.problem.translated_name(request.LANGUAGE_CODE),
+        'profile_id': request.profile.id if authenticated else 0,
+    })
 
 
-class AllSubmissions(SubmissionsListBase):
+class AllSubmissions(InfinitePaginationMixin, SubmissionsListBase):
     stats_update_interval = 3600
+
+    @property
+    def use_infinite_pagination(self):
+        return not self.in_contest
 
     def get_my_submissions_page(self):
         if self.request.user.is_authenticated:
@@ -459,15 +546,15 @@ class AllSubmissions(SubmissionsListBase):
         context['stats_update_interval'] = self.stats_update_interval
         return context
 
-    def _get_result_data(self):
-        if self.in_contest or self.selected_languages or self.selected_statuses:
-            return super(AllSubmissions, self)._get_result_data()
+    def _get_result_data(self, queryset=None):
+        if queryset is not None or self.in_contest or self.selected_languages or self.selected_statuses:
+            return super(AllSubmissions, self)._get_result_data(queryset)
 
         key = 'global_submission_result_data'
         result = cache.get(key)
         if result:
             return result
-        result = super(AllSubmissions, self)._get_result_data()
+        result = super(AllSubmissions, self)._get_result_data(Submission.objects.all())
         cache.set(key, result, self.stats_update_interval)
         return result
 
@@ -500,12 +587,44 @@ class ForceContestMixin(object):
         return super(ForceContestMixin, self).get(request, *args, **kwargs)
 
 
+class UserAllContestSubmissions(ForceContestMixin, AllUserSubmissions):
+    def get_title(self):
+        if self.is_own:
+            return _('My submissions in %(contest)s') % {'contest': self.contest.name}
+        return _("%(user)s's submissions in %(contest)s") % {
+            'user': self.profile.display_name,
+            'contest': self.contest.name,
+        }
+
+    def access_check(self, request):
+        super().access_check(request)
+        if not self.contest.users.filter(user_id=self.profile.id).exists():
+            raise Http404()
+        if not self.is_own and not self.contest.can_see_full_scoreboard(self.request.user):
+            raise Http404()
+
+    def get_content_title(self):
+        if self.is_own:
+            return format_html(_('My submissions in <a href="{1}">{0}</a>'),
+                               self.contest.name, reverse('contest_view', args=[self.contest.key]))
+        return format_html(_('<a href="{1}">{0}</a>\'s submissions in <a href="{3}">{2}</a>'),
+                           self.profile.display_name, reverse('user_page', args=[self.username]),
+                           self.contest.name, reverse('contest_view', args=[self.contest.key]))
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        # FIXME: fix this line of code when #1509 is implemented
+        if not self.request.user.is_authenticated or self.request.profile.id not in self.contest.editor_ids:
+            filter_submissions_by_visible_problems(queryset, self.request.user)
+        return queryset
+
+
 class UserContestSubmissions(ForceContestMixin, UserProblemSubmissions):
     def get_title(self):
         if self.problem.is_accessible_by(self.request.user):
-            return "%s's submissions for %s in %s" % (self.username, self.problem_name, self.contest.name)
+            return "%s's submissions for %s in %s" % (self.profile.display_name, self.problem_name, self.contest.name)
         return "%s's submissions for problem %s in %s" % (
-            self.username, self.get_problem_number(self.problem), self.contest.name)
+            self.profile.display_name, self.get_problem_number(self.problem), self.contest.name)
 
     def access_check(self, request):
         super(UserContestSubmissions, self).access_check(request)
@@ -516,11 +635,11 @@ class UserContestSubmissions(ForceContestMixin, UserProblemSubmissions):
         if self.problem.is_accessible_by(self.request.user):
             return format_html(_('<a href="{1}">{0}</a>\'s submissions for '
                                  '<a href="{3}">{2}</a> in <a href="{5}">{4}</a>'),
-                               self.username, reverse('user_page', args=[self.username]),
+                               self.profile.display_name, reverse('user_page', args=[self.username]),
                                self.problem_name, reverse('problem_detail', args=[self.problem.code]),
                                self.contest.name, reverse('contest_view', args=[self.contest.key]))
         return format_html(_('<a href="{1}">{0}</a>\'s submissions for '
                              'problem {2} in <a href="{4}">{3}</a>'),
-                           self.username, reverse('user_page', args=[self.username]),
+                           self.profile.display_name, reverse('user_page', args=[self.username]),
                            self.get_problem_number(self.problem),
                            self.contest.name, reverse('contest_view', args=[self.contest.key]))

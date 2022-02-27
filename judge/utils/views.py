@@ -28,6 +28,18 @@ def generic_message(request, title, message, status=None):
     }, status=status)
 
 
+def add_file_response(request, response, url_path, file_path, file_object=None):
+    if url_path is not None and request.META.get('SERVER_SOFTWARE', '').startswith('nginx/'):
+        response['X-Accel-Redirect'] = url_path
+    else:
+        if file_object is None:
+            with open(file_path, 'rb') as f:
+                response.content = f.read()
+        else:
+            with file_object.open(file_path, 'rb') as f:
+                response.content = f.read()
+
+
 def paginate_query_context(request):
     query = request.GET.copy()
     query.setlist('page', [])
@@ -38,6 +50,14 @@ def paginate_query_context(request):
     else:
         return {'page_prefix': '%s?page=' % request.path,
                 'first_page_href': request.path}
+
+
+class NoBatchDeleteMixin(object):
+    def get_actions(self, request):
+        actions = super(NoBatchDeleteMixin, self).get_actions(request)
+        if 'delete_selected' in actions:
+            del actions['delete_selected']
+        return actions
 
 
 class TitleMixin(object):

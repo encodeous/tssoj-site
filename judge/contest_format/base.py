@@ -1,6 +1,4 @@
-from abc import ABCMeta, abstractmethod, abstractproperty
-
-from django.utils import six
+from abc import ABCMeta, abstractmethod
 
 
 class abstractclassmethod(classmethod):
@@ -11,13 +9,14 @@ class abstractclassmethod(classmethod):
         super(abstractclassmethod, self).__init__(callable)
 
 
-class BaseContestFormat(six.with_metaclass(ABCMeta)):
+class BaseContestFormat(metaclass=ABCMeta):
     @abstractmethod
     def __init__(self, contest, config):
         self.config = config
         self.contest = contest
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def name(self):
         """
         Name of this contest format. Should be invoked with gettext_lazy.
@@ -79,6 +78,25 @@ class BaseContestFormat(six.with_metaclass(ABCMeta)):
         :param participation: The ContestParticipation object.
         :param contest_problems: The list of ContestProblem objects to display performance for.
         :return: A list of dictionaries, whose content is to be determined by the contest system.
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_label_for_problem(self, index):
+        """
+        Returns the problem label for a given zero-indexed index.
+
+        :param index: The zero-indexed problem index.
+        :return: A string, the problem label.
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_short_form_display(self):
+        """
+        Returns a generator of Markdown strings to display the contest format's settings in short form.
+
+        :return: A generator, where each item is an individual line.
         """
         raise NotImplementedError()
 

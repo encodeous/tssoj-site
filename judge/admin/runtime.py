@@ -11,7 +11,7 @@ from reversion.admin import VersionAdmin
 
 from django_ace import AceWidget
 from judge.models import Judge, Problem
-from judge.widgets import AdminHeavySelect2MultipleWidget, AdminPagedownWidget
+from judge.widgets import AdminHeavySelect2MultipleWidget, AdminMartorWidget
 
 
 class LanguageForm(ModelForm):
@@ -23,12 +23,11 @@ class LanguageForm(ModelForm):
         widget=AdminHeavySelect2MultipleWidget(data_view='problem_select2'))
 
     class Meta:
-        if AdminPagedownWidget is not None:
-            widgets = {'description': AdminPagedownWidget}
+        widgets = {'description': AdminMartorWidget}
 
 
 class LanguageAdmin(VersionAdmin):
-    fields = ('key', 'name', 'short_name', 'common_name', 'ace', 'pygments', 'info', 'description',
+    fields = ('key', 'name', 'short_name', 'common_name', 'ace', 'pygments', 'info', 'extension', 'description',
               'template', 'problems')
     list_display = ('key', 'name', 'common_name', 'info')
     form = LanguageForm
@@ -50,29 +49,24 @@ class GenerateKeyTextInput(TextInput):
     def render(self, name, value, attrs=None, renderer=None):
         text = super(TextInput, self).render(name, value, attrs)
         return mark_safe(text + format_html(
-            '''\
+            """\
 <a href="#" onclick="return false;" class="button" id="id_{0}_regen">Regenerate</a>
 <script type="text/javascript">
 django.jQuery(document).ready(function ($) {{
     $('#id_{0}_regen').click(function () {{
-        var length = 100,
-            charset = "abcdefghijklnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789`~!@#$%^&*()_+-=|[]{{}};:,<>./?",
-            key = "";
-        for (var i = 0, n = charset.length; i < length; ++i) {{
-            key += charset.charAt(Math.floor(Math.random() * n));
-        }}
+        var rand = new Uint8Array(75);
+        window.crypto.getRandomValues(rand);
+        var key = btoa(String.fromCharCode.apply(null, rand));
         $('#id_{0}').val(key);
     }});
 }});
 </script>
-''', name))
+""", name))
 
 
 class JudgeAdminForm(ModelForm):
     class Meta:
-        widgets = {'auth_key': GenerateKeyTextInput}
-        if AdminPagedownWidget is not None:
-            widgets['description'] = AdminPagedownWidget
+        widgets = {'auth_key': GenerateKeyTextInput, 'description': AdminMartorWidget}
 
 
 class JudgeAdmin(VersionAdmin):
@@ -86,6 +80,9 @@ class JudgeAdmin(VersionAdmin):
     )
     list_display = ('name', 'online', 'start_time', 'ping', 'load', 'last_ip')
     ordering = ['-online', 'name']
+    formfield_overrides = {
+        TextField: {'widget': AdminMartorWidget},
+    }
 
     def get_urls(self):
         return ([url(r'^(\d+)/disconnect/$', self.disconnect_view, name='judge_judge_disconnect'),
@@ -113,8 +110,3 @@ class JudgeAdmin(VersionAdmin):
         if result and obj is not None:
             return not obj.online
         return result
-
-    if AdminPagedownWidget is not None:
-        formfield_overrides = {
-            TextField: {'widget': AdminPagedownWidget},
-        }

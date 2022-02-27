@@ -1,12 +1,14 @@
 from django.contrib import admin
 from django.forms import ModelForm
+from django.urls import reverse_lazy
 from django.utils.html import format_html
-from django.utils.translation import gettext, gettext_lazy as _, ungettext
+from django.utils.translation import gettext, gettext_lazy as _, ngettext
 from reversion.admin import VersionAdmin
 
 from django_ace import AceWidget
-from judge.models import Profile
-from judge.widgets import AdminPagedownWidget, AdminSelect2Widget
+from judge.models import Profile, WebAuthnCredential
+from judge.utils.views import NoBatchDeleteMixin
+from judge.widgets import AdminMartorWidget, AdminSelect2Widget
 
 
 class ProfileForm(ModelForm):
@@ -25,9 +27,8 @@ class ProfileForm(ModelForm):
             'language': AdminSelect2Widget,
             'ace_theme': AdminSelect2Widget,
             'current_contest': AdminSelect2Widget,
+            'about': AdminMartorWidget(attrs={'data-markdownfy-url': reverse_lazy('profile_preview')}),
         }
-        if AdminPagedownWidget is not None:
-            widgets['about'] = AdminPagedownWidget
 
 
 class TimezoneFilter(admin.SimpleListFilter):
@@ -43,10 +44,19 @@ class TimezoneFilter(admin.SimpleListFilter):
         return queryset.filter(timezone=self.value())
 
 
-class ProfileAdmin(VersionAdmin):
+class WebAuthnInline(admin.TabularInline):
+    model = WebAuthnCredential
+    readonly_fields = ('cred_id', 'public_key', 'counter')
+    extra = 0
+
+    def has_add_permission(self, request):
+        return False
+
+
+class ProfileAdmin(NoBatchDeleteMixin, VersionAdmin):
     fields = ('user', 'display_rank', 'about', 'organizations', 'timezone', 'language', 'ace_theme',
-              'math_engine', 'last_access', 'ip', 'mute', 'is_unlisted', 'notes', 'is_totp_enabled', 'user_script',
-              'current_contest')
+              'math_engine', 'last_access', 'ip', 'mute', 'is_unlisted', 'username_display_override',
+              'notes', 'is_totp_enabled', 'user_script', 'current_contest')
     readonly_fields = ('user',)
     list_display = ('admin_user_admin', 'email', 'is_totp_enabled', 'timezone_full',
                     'date_joined', 'last_access', 'ip', 'show_public')
@@ -57,6 +67,7 @@ class ProfileAdmin(VersionAdmin):
     actions_on_top = True
     actions_on_bottom = True
     form = ProfileForm
+    inlines = [WebAuthnInline]
 
     def get_queryset(self, request):
         return super(ProfileAdmin, self).get_queryset(request).select_related('user')
@@ -65,6 +76,7 @@ class ProfileAdmin(VersionAdmin):
         if request.user.has_perm('judge.totp'):
             fields = list(self.fields)
             fields.insert(fields.index('is_totp_enabled') + 1, 'totp_key')
+            fields.insert(fields.index('totp_key') + 1, 'scratch_codes')
             return tuple(fields)
         else:
             return self.fields
@@ -105,9 +117,9 @@ class ProfileAdmin(VersionAdmin):
         for profile in queryset:
             profile.calculate_points()
             count += 1
-        self.message_user(request, ungettext('%d user have scores recalculated.',
-                                             '%d users have scores recalculated.',
-                                             count) % count)
+        self.message_user(request, ngettext('%d user have scores recalculated.',
+                                            '%d users have scores recalculated.',
+                                            count) % count)
     recalculate_points.short_description = _('Recalculate scores')
 
     def get_form(self, request, obj=None, **kwargs):
